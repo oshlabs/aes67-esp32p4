@@ -72,6 +72,8 @@ struct aes67_webui {
     bool                    running;
     int                     bucket;         /* mutation rate limit */
     int64_t                 bucket_last_us;
+    aes67_webui_control_t   controls[AES67_WEBUI_MAX_CONTROLS];
+    int                     control_count;
 };
 
 static bool token_required(void);
@@ -388,6 +390,35 @@ static bool json_remotes_array(jbuf_t *jb, struct aes67_webui *ctx)
             break;
         }
         first = false;
+    }
+    jb_printf(jb, "]");
+    return complete;
+}
+
+static bool json_controls_array(jbuf_t *jb, struct aes67_webui *ctx)
+{
+    bool complete = true;
+    jb_printf(jb, "[");
+    for (int i = 0; i < ctx->control_count; i++) {
+        const aes67_webui_control_t *c = &ctx->controls[i];
+        int32_t value = 0;
+        if (c->get(c->user_data, &value) != ESP_OK) {
+            value = c->min;
+        }
+        size_t mark = jb_mark(jb);
+        bool ok = jb_printf(jb, "%s{\"name\":", i ? "," : "")
+               && jb_quoted(jb, c->name)
+               && jb_printf(jb, ",\"label\":")
+               && jb_quoted(jb, c->label ? c->label : c->name)
+               && jb_printf(jb, ",\"unit\":")
+               && jb_quoted(jb, c->unit ? c->unit : "")
+               && jb_printf(jb, ",\"min\":%ld,\"max\":%ld,\"step\":%ld,\"value\":%ld}",
+                            (long)c->min, (long)c->max, (long)c->step, (long)value);
+        if (!ok) {
+            jb_rollback(jb, mark);
+            complete = false;
+            break;
+        }
     }
     jb_printf(jb, "]");
     return complete;
@@ -719,6 +750,85 @@ static esp_err_t handler_delete_sink(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- GET /api/controls, POST /api/controls/<name> ---- */
+
+static esp_err_t handler_api_controls(httpd_req_t *req)
+{
+    struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
+    jbuf_t jb;
+    jb_init(&jb, ctx->json, JSON_BUF_SIZE);
+    json_controls_array(&jb, ctx);
+    return send_json(req, &jb);
+}
+
+static esp_err_t handler_post_control(httpd_req_t *req)
+{
+    struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
+
+    if (authorize_mutation(req) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    const char *name = strrchr(req->uri, '/');
+    name = name ? name + 1 : "";
+    aes67_webui_control_t *c = NULL;
+    for (int i = 0; i < ctx->control_count; i++) {
+        if (strcmp(ctx->controls[i].name, name) == 0) {
+            c = &ctx->controls[i];
+            break;
+        }
+    }
+    if (!c) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No such control");
+        return ESP_FAIL;
+    }
+
+    char body[64];
+    int len = req->content_len;
+    if (len <= 0 || len >= (int)sizeof(body)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body length");
+        return ESP_FAIL;
+    }
+    int got = httpd_req_recv(req, body, len);
+    if (got != len) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete body");
+        return ESP_FAIL;
+    }
+    body[len] = '\0';
+
+    cJSON *root = cJSON_ParseWithLength(body, len);
+    const cJSON *jv = root ? cJSON_GetObjectItemCaseSensitive(root, "value") : NULL;
+    if (!cJSON_IsNumber(jv)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body must be {\"value\":N}");
+        return ESP_FAIL;
+    }
+    double v = jv->valuedouble;
+    cJSON_Delete(root);
+
+    if (v < c->min || v > c->max) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Value out of range");
+        return ESP_FAIL;
+    }
+    /* snap to the step grid */
+    int32_t value = c->min + (int32_t)((v - c->min) / c->step + 0.5) * c->step;
+    if (value > c->max) value = c->max;
+
+    esp_err_t ret = c->set(c->user_data, value);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "control '%s' set %ld failed: %s", c->name, (long)value, esp_err_to_name(ret));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Control rejected the value");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "control '%s' = %ld", c->name, (long)value);
+
+    char resp[96];
+    int n = snprintf(resp, sizeof(resp), "{\"name\":\"%s\",\"value\":%ld}", c->name, (long)value);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, n);
+    return ESP_OK;
+}
+
 /* ---- WebSocket ---- */
 
 /*
@@ -784,6 +894,8 @@ static int build_status_frame(struct aes67_webui *ctx, char *buf, size_t cap)
     complete &= json_sinks_array(&jb, ctx);
     jb_printf(&jb, ",\"sap_remotes\":");
     complete &= json_remotes_array(&jb, ctx);
+    jb_printf(&jb, ",\"controls\":");
+    complete &= json_controls_array(&jb, ctx);
 
     /* Ethernet hook stats (defined in the example's main.c for now) */
     extern uint32_t s_hook_pkt_count;
@@ -1018,6 +1130,22 @@ esp_err_t aes67_webui_start(aes67_webui_handle_t handle)
     };
     httpd_register_uri_handler(handle->httpd, &uri_sinks_delete);
 
+    /* REST: runtime controls */
+    const httpd_uri_t uri_controls_get = {
+        .uri = "/api/controls",
+        .method = HTTP_GET,
+        .handler = handler_api_controls,
+        .user_ctx = handle,
+    };
+    httpd_register_uri_handler(handle->httpd, &uri_controls_get);
+    const httpd_uri_t uri_controls_post = {
+        .uri = "/api/controls/*",
+        .method = HTTP_POST,
+        .handler = handler_post_control,
+        .user_ctx = handle,
+    };
+    httpd_register_uri_handler(handle->httpd, &uri_controls_post);
+
     /* Periodic status push: the timer only queues work onto the server
      * task, which builds and sends the frame (see ws_push_work). */
     handle->running = true;
@@ -1063,5 +1191,38 @@ esp_err_t aes67_webui_stop(aes67_webui_handle_t handle)
     }
 
     ESP_LOGI(TAG, "Web UI stopped");
+    return ESP_OK;
+}
+
+esp_err_t aes67_webui_add_control(aes67_webui_handle_t handle,
+                                  const aes67_webui_control_t *control)
+{
+    if (!handle || !control || !control->name || !control->get || !control->set ||
+        control->step <= 0 || control->max < control->min) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t n = strlen(control->name);
+    if (n == 0 || n > 23) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (const char *c = control->name; *c; c++) {
+        bool ok = (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+                  (*c >= '0' && *c <= '9') || *c == '_' || *c == '-';
+        if (!ok) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    for (int i = 0; i < handle->control_count; i++) {
+        if (strcmp(handle->controls[i].name, control->name) == 0) {
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    if (handle->control_count >= AES67_WEBUI_MAX_CONTROLS) {
+        return ESP_ERR_NO_MEM;
+    }
+    handle->controls[handle->control_count++] = *control;
+    ESP_LOGI(TAG, "control '%s' registered (%ld..%ld step %ld %s)",
+             control->name, (long)control->min, (long)control->max,
+             (long)control->step, control->unit ? control->unit : "");
     return ESP_OK;
 }

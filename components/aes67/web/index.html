@@ -40,6 +40,8 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 #overlay.show{display:flex}
 #overlay .box{background:#1a1a1a;border:1px solid #e8a030;border-radius:6px;padding:20px 30px;text-align:center;font-size:13px;color:#ccc}
 #overlay .box .dot{width:10px;height:10px;margin:0 auto 10px}
+.ctl{display:flex;align-items:center;gap:10px;padding:4px 0}
+.ctl .lbl{width:140px}.ctl input[type=range]{flex:1;accent-color:#e8a030}.ctl .val{width:70px;text-align:right}
 .tag{font-size:9px;padding:1px 5px;border-radius:2px;margin-left:6px;vertical-align:middle;color:#111;font-weight:600}
 .tag-gm{background:#e8a030}.tag-slave{background:#4a4}
 @media(max-width:700px){.grid{grid-template-columns:1fr}}
@@ -62,6 +64,7 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 <span><span class="lbl">Delay </span><span class="val" id="py">--</span><span class="lbl"> ns</span></span>
 </div>
 </div>
+<div class="card" id="ctlc" style="display:none"><h2>Controls</h2><div id="ctl"></div></div>
 <div class="grid">
 <div class="card"><h2>Sources (TX)</h2><div id="sc"></div></div>
 <div class="card"><h2>Sinks (RX)</h2><div id="sk"></div></div>
@@ -209,6 +212,35 @@ function renderRemotes(arr){
   });
 }
 
+/* Controls: one slider per registered control, built when first seen.
+   A slider being dragged is not overwritten by status frames; its value is
+   sent (debounced) and the device's answer is shown. */
+var ctls={};
+function mkControl(c){
+  var row=el("div","ctl"),lbl=el("span","lbl",c.label),inp=el("input"),val=el("span","val");
+  inp.type="range";inp.min=c.min;inp.max=c.max;inp.step=c.step;inp.value=c.value;
+  var o={row:row,inp:inp,val:val,unit:c.unit||"",busy:false,timer:null};
+  function show(x){val.textContent=x+(o.unit?" "+o.unit:"")}
+  show(c.value);
+  inp.addEventListener("input",function(){o.busy=true;show(inp.value);
+    clearTimeout(o.timer);o.timer=setTimeout(function(){
+      api("POST","/api/controls/"+c.name,{value:Number(inp.value)}).then(function(r){return r.ok?r.json():null})
+        .then(function(d){if(d)show(d.value)}).finally(function(){o.busy=false});
+    },150);
+  });
+  row.appendChild(lbl);row.appendChild(inp);row.appendChild(val);
+  g("ctl").appendChild(row);ctls[c.name]=o;
+}
+function updateControls(arr){
+  if(!arr||!arr.length){g("ctlc").style.display="none";return}
+  g("ctlc").style.display="";
+  arr.forEach(function(c){
+    var o=ctls[c.name];
+    if(!o){mkControl(c);return}
+    if(!o.busy&&document.activeElement!==o.inp){o.inp.value=c.value;o.val.textContent=c.value+(o.unit?" "+o.unit:"")}
+  });
+}
+
 function onMsg(e){
   var d;
   try{d=JSON.parse(e.data)}catch(x){showOl("Bad status frame from device",true);return}
@@ -228,6 +260,7 @@ function onMsg(e){
   updateSlots("src",d.sources);
   updateSlots("sink",d.sinks);
   renderRemotes(d.sap_remotes);
+  updateControls(d.controls);
   g("fu").textContent=fmtUp(d.uptime);
   g("fh").textContent=fmt(d.heap_free)+" B"+(d.truncated?" (status truncated)":"");
   var eth=d.eth||{},now=Date.now();
