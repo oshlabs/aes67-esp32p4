@@ -45,8 +45,8 @@ void aes67_mdns_deinit(void);
 /* Define the event base for the ESP event loop */
 ESP_EVENT_DEFINE_BASE(AES67_EVENT);
 
-/* Semaphore signaled by the hardware PTP timer ISR */
-static SemaphoreHandle_t s_frame_sem = NULL;
+/* The TIC task, woken by the hardware PTP timer ISR with a task notification */
+static TaskHandle_t s_tic_task = NULL;
 
 /* Internal node structure holding all subsystem handles */
 struct aes67_node {
@@ -68,16 +68,24 @@ static aes67_node_handle_t s_node = NULL;
 
 /*
  * Hardware PTP timer ISR callback. Fires at exact PTP-clock-aligned
- * audio frame boundaries. Gives the semaphore to wake the TX task.
+ * audio frame boundaries and wakes the TIC task. The wake-up is only a
+ * signal: the task works out how many frame periods have elapsed from
+ * PTP time, so a wake-up lost to a busy core does not lose a packet.
  */
 static void IRAM_ATTR hw_frame_isr(void *user_data)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(s_frame_sem, &xHigherPriorityTaskWoken);
+    if (s_tic_task) {
+        vTaskNotifyGiveFromISR(s_tic_task, &xHigherPriorityTaskWoken);
+    }
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
     }
 }
+
+/* Catch-up bound: more than this many periods behind means a stall, not a
+ * busy core; the capture backlog is dropped instead of being replayed. */
+#define TIC_MAX_CATCHUP 8
 
 /*
  * Unified audio frame task (TIC). Driven by the hardware PTP timer ISR,
@@ -114,53 +122,106 @@ static void audio_frame_task(void *arg)
     ESP_LOGI(TAG, "Audio frame task started (hw-timed TX%s)",
              cap_buf ? "+capture" : "");
 
+    const uint64_t period_ns = aes67_hw_timer_period_ns();
+    const uint32_t need = spp * node->config.audio.channels * sizeof(int32_t);
+    /* Wait at most two periods (at least 2 ms) for a wake-up before
+     * treating the timer as stalled. */
+    const TickType_t wait_ticks = pdMS_TO_TICKS((period_ns * 2) / 1000000 < 2 ? 2 : (period_ns * 2) / 1000000);
+    uint64_t last_boundary_ns = 0;      /* PTP time of the last processed frame boundary */
     uint32_t missed_waits = 0;
+    uint32_t catchups = 0, stalls = 0;
+
+    s_tic_task = xTaskGetCurrentTaskHandle();
 
     while (node->running) {
         /* Wait for the hardware PTP frame timer ISR */
-        if (xSemaphoreTake(s_frame_sem, pdMS_TO_TICKS(10)) != pdTRUE) {
-            /* No tick for 10 ms (>= 2 periods at 4 ms ptime). After a
-             * backward PTP step the programmed target time can sit far
-             * in the future and the ISR never fires again; re-anchor it. */
-            if (++missed_waits >= 5) {
+        if (ulTaskNotifyTake(pdTRUE, wait_ticks) == 0) {
+            if (++missed_waits >= 3) {
+                /* Six periods without a tick: the timer is dead (a target
+                 * written in the past, a backward PTP step). Re-arm it,
+                 * drop the capture backlog so the stream does not carry a
+                 * permanent extra delay, and restart the tick grid. */
                 missed_waits = 0;
+                stalls++;
                 if (aes67_hw_timer_rearm() == ESP_OK && cap_buf && cap_samples) {
-                    /* Drop the audio that piled up while stalled so the
-                     * stream does not carry a permanent extra delay. */
-                    uint32_t need = spp * node->config.audio.channels * sizeof(int32_t);
                     while (xStreamBufferBytesAvailable(cap_buf) > 2 * need) {
                         xStreamBufferReceive(cap_buf, cap_samples, need, 0);
                     }
                 }
+                last_boundary_ns = 0;
             }
             continue;
         }
         missed_waits = 0;
 
-        frame_count++;
+        /* How many frame periods have passed since the last one we
+         * processed? Normally one. A wake-up lost while lwIP or the EMAC
+         * task held the core shows up as two or three; process them all,
+         * each with its own packet, so the stream stays on PTP time. */
+        uint64_t now_ns;
+        aes67_ptp_get_time_ns(node->ptp, &now_ns);
+        uint64_t boundary_ns = (now_ns / period_ns) * period_ns;
+        uint32_t due = 1;
+        if (last_boundary_ns != 0 && boundary_ns > last_boundary_ns) {
+            due = (uint32_t)((boundary_ns - last_boundary_ns) / period_ns);
+            if (due > TIC_MAX_CATCHUP) {
+                /* Too far behind to be a busy core: treat as a stall,
+                 * drop the backlog and resume from here. */
+                due = 1;
+                stalls++;
+                if (cap_buf && cap_samples) {
+                    while (xStreamBufferBytesAvailable(cap_buf) > 2 * need) {
+                        xStreamBufferReceive(cap_buf, cap_samples, need, 0);
+                    }
+                }
+            }
+        } else if (last_boundary_ns != 0 && boundary_ns == last_boundary_ns) {
+            due = 0;                    /* woken twice within one period */
+        }
+        last_boundary_ns = boundary_ns;
 
-        /* Get current PTP time for RTP timestamp generation */
-        uint64_t ptp_time_ns;
-        aes67_ptp_get_time_ns(node->ptp, &ptp_time_ns);
-        uint32_t rtp_ts = aes67_ptp_time_to_rtp_ts(
-            ptp_time_ns, node->config.audio.sample_rate);
-
-        /* Feed captured I2S audio into source stream ring buffers.
-         * The RX DMA ISR writes captured int32 samples to cap_buf.
-         * We read one packet worth and write to all active sources. */
-        if (cap_buf && cap_samples) {
-            uint32_t need = spp * node->config.audio.channels * sizeof(int32_t);
-            size_t got = xStreamBufferReceive(cap_buf, cap_samples, need, 0);
-            if (got >= need) {
-                /* Fan out to every active source under the engine lock */
+        for (uint32_t k = 0; k < due; k++) {
+            /* A tick is processed only once its packet of captured audio
+             * is complete. The capture DMA delivers 16-frame chunks, so a
+             * wake-up that is a little late can find the newest packet
+             * short; sending nothing in that slot would leave a sequence
+             * gap. Defer this and the following ticks to the next wake-up. */
+            if (cap_buf && cap_samples) {
+                if (xStreamBufferBytesAvailable(cap_buf) < need) {
+                    last_boundary_ns = boundary_ns - (uint64_t)(due - k) * period_ns;
+                    break;
+                }
+                xStreamBufferReceive(cap_buf, cap_samples, need, 0);
                 aes67_rtp_engine_feed_capture(node->rtp, cap_samples, spp);
             }
+
+            frame_count++;
+            if (k > 0) {
+                catchups++;
+            }
+
+            /* RTP timestamp for this tick's boundary */
+            uint64_t tick_ns = boundary_ns - (uint64_t)(due - 1 - k) * period_ns;
+            uint32_t rtp_ts = aes67_ptp_time_to_rtp_ts(tick_ns, node->config.audio.sample_rate);
+
+            /* TX: Process all active source streams - read from ring buffers,
+             * convert to network format, send RTP packets */
+            aes67_rtp_engine_process_tx(node->rtp, rtp_ts);
         }
 
-        /* TX: Process all active source streams - read from ring buffers,
-         * convert to network format, send RTP packets */
-        aes67_rtp_engine_process_tx(node->rtp, rtp_ts);
+        /* Once a minute, account for what the reconstruction did */
+        if ((frame_count % 60000) == 0 && (catchups || stalls)) {
+            aes67_hw_timer_stats_t ts;
+            aes67_hw_timer_get_stats(&ts);
+            ESP_LOGI(TAG, "TIC: %lu ticks, %lu caught up, %lu stalls; timer fires %lu, "
+                     "re-anchors %lu, re-arms %lu",
+                     (unsigned long)frame_count, (unsigned long)catchups,
+                     (unsigned long)stalls, (unsigned long)ts.fires,
+                     (unsigned long)ts.reanchors, (unsigned long)ts.rearms);
+        }
     }
+
+    s_tic_task = NULL;
 
     heap_caps_free(cap_samples);
     heap_caps_free(playback_buf);
@@ -418,12 +479,10 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
     uint32_t frame_ns = (uint32_t)((uint64_t)samples_per_pkt * 1000000000ULL /
                                     node->config.audio.sample_rate);
 
-    /* Create the frame semaphore for ISR -> task signaling */
-    s_frame_sem = xSemaphoreCreateBinary();
     node->tic_done = xSemaphoreCreateBinary();
     node->pb_done = xSemaphoreCreateBinary();
-    if (!s_frame_sem || !node->tic_done || !node->pb_done) {
-        ESP_LOGE(TAG, "failed to create frame semaphores");
+    if (!node->tic_done || !node->pb_done) {
+        ESP_LOGE(TAG, "failed to create task semaphores");
         goto fail_cb;
     }
 
@@ -445,7 +504,6 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
     return ESP_OK;
 
 fail_cb:
-    if (s_frame_sem) { vSemaphoreDelete(s_frame_sem); s_frame_sem = NULL; }
     if (node->tic_done) vSemaphoreDelete(node->tic_done);
     if (node->pb_done) vSemaphoreDelete(node->pb_done);
     aes67_session_destroy(node->session);
@@ -649,12 +707,8 @@ esp_err_t aes67_node_destroy(aes67_node_handle_t handle)
     aes67_rtp_engine_destroy(handle->rtp);
     aes67_ptp_destroy(handle->ptp);
 
-    /* Frame timer and the ISR -> task semaphore (file statics, single node) */
+    /* Frame timer (file static, single node) */
     aes67_hw_timer_deinit();
-    if (s_frame_sem) {
-        vSemaphoreDelete(s_frame_sem);
-        s_frame_sem = NULL;
-    }
     vSemaphoreDelete(handle->tic_done);
     vSemaphoreDelete(handle->pb_done);
     s_node = NULL;

@@ -28,12 +28,20 @@
 
 static const char *TAG = "aes67_hw_timer";
 
+/* A target written less than this far ahead of the clock may already be
+ * in the past by the time the register takes it; the compare then never
+ * matches and the timer is dead until someone re-arms it. */
+#define HW_TIMER_GUARD_NS   100000
+
 static struct {
     uint32_t frame_period_ns;
     aes67_hw_timer_cb_t cb;
     void *user_data;
     struct timespec next_time;
     bool running;
+    volatile uint32_t fires;        /* ISR invocations */
+    volatile uint32_t reanchors;    /* targets re-anchored because they were too close */
+    volatile uint32_t rearms;       /* re-armed from task context after a stall */
 } s_timer;
 
 /* Add nanoseconds to a timespec, handling overflow */
@@ -53,6 +61,7 @@ IRAM_ATTR static bool hw_timer_isr(esp_eth_mediator_t *eth, void *user_args)
     if (!s_timer.running) {
         return false;
     }
+    s_timer.fires++;
 
     /* Fire the user callback */
     if (s_timer.cb) {
@@ -62,22 +71,24 @@ IRAM_ATTR static bool hw_timer_isr(esp_eth_mediator_t *eth, void *user_args)
     /* Schedule the next target time */
     timespec_add_ns(&s_timer.next_time, s_timer.frame_period_ns);
 
-    /* Verify the next time is still in the future. If we're behind
-     * (e.g., after a PTP clock jump), re-anchor to now + one period
-     * instead of looping to catch up (which would hang the ISR). */
+    /* The next target must lie safely in the future when it is written.
+     * If we are late (ISR latency, a PTP step) or merely too close, skip
+     * to the first frame boundary at least a guard interval ahead rather
+     * than loop to catch up. The task reconstructs skipped ticks from
+     * PTP time. */
     struct timespec now;
     esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &now);
 
     int64_t diff_ns = ((int64_t)s_timer.next_time.tv_sec - now.tv_sec) * 1000000000LL
                     + (s_timer.next_time.tv_nsec - now.tv_nsec);
 
-    if (diff_ns <= 0) {
-        /* We're behind - re-anchor to next aligned boundary from now */
-        uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+    if (diff_ns < HW_TIMER_GUARD_NS) {
+        uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec + HW_TIMER_GUARD_NS;
         uint64_t period = s_timer.frame_period_ns;
         uint64_t next_ns = ((now_ns / period) + 1) * period;
         s_timer.next_time.tv_sec = (time_t)(next_ns / 1000000000ULL);
         s_timer.next_time.tv_nsec = (long)(next_ns % 1000000000ULL);
+        s_timer.reanchors++;
     }
 
     esp_eth_clock_set_target_time(CLOCK_PTP_SYSTEM, &s_timer.next_time);
@@ -118,8 +129,8 @@ esp_err_t aes67_hw_timer_start(void)
         return ESP_FAIL;
     }
 
-    /* Align to next frame boundary: round up to nearest frame_period_ns */
-    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+    /* Align to the next frame boundary at least a guard interval ahead */
+    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec + HW_TIMER_GUARD_NS;
     uint64_t period = s_timer.frame_period_ns;
     uint64_t next_ns = ((now_ns / period) + 1) * period;
 
@@ -149,13 +160,14 @@ esp_err_t aes67_hw_timer_rearm(void)
     if (esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &now) != 0) {
         return ESP_FAIL;
     }
-    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec + HW_TIMER_GUARD_NS;
     uint64_t period = s_timer.frame_period_ns;
     uint64_t next_ns = ((now_ns / period) + 1) * period;
 
     s_timer.next_time.tv_sec = (time_t)(next_ns / 1000000000ULL);
     s_timer.next_time.tv_nsec = (long)(next_ns % 1000000000ULL);
     esp_eth_clock_set_target_time(CLOCK_PTP_SYSTEM, &s_timer.next_time);
+    s_timer.rearms++;
 
     ESP_LOGW(TAG, "re-armed (target: %lld.%09ld)",
              (long long)s_timer.next_time.tv_sec, s_timer.next_time.tv_nsec);
@@ -176,4 +188,17 @@ esp_err_t aes67_hw_timer_deinit(void)
     esp_eth_clock_register_target_cb(CLOCK_PTP_SYSTEM, NULL);
     memset(&s_timer, 0, sizeof(s_timer));
     return ESP_OK;
+}
+
+void aes67_hw_timer_get_stats(aes67_hw_timer_stats_t *stats)
+{
+    if (!stats) return;
+    stats->fires = s_timer.fires;
+    stats->reanchors = s_timer.reanchors;
+    stats->rearms = s_timer.rearms;
+}
+
+uint32_t aes67_hw_timer_period_ns(void)
+{
+    return s_timer.frame_period_ns;
 }

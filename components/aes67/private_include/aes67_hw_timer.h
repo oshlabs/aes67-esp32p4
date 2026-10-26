@@ -59,6 +59,15 @@ esp_err_t aes67_hw_timer_stop(void);
  */
 esp_err_t aes67_hw_timer_deinit(void);
 
+typedef struct {
+    uint32_t fires;         /* ISR invocations since init */
+    uint32_t reanchors;     /* next target skipped ahead because it was too close */
+    uint32_t rearms;        /* re-armed from task context after a stall */
+} aes67_hw_timer_stats_t;
+
+void aes67_hw_timer_get_stats(aes67_hw_timer_stats_t *stats);
+uint32_t aes67_hw_timer_period_ns(void);
+
 #ifdef __cplusplus
 }
 #endif
