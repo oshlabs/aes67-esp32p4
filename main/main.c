@@ -119,28 +119,17 @@ static const char *TAG = "main";
 #define ETH_PHY_RST_GPIO    51
 #define ETH_PHY_ADDR        1
 
-/* I2S pin configuration.
- *
- * External I2S DAC (active):
- *   DOUT=GPIO32, LRCLK=GPIO33, BCLK=GPIO36, MCLK=GPIO13
- *
- * ESP32-P4-NANO onboard ES8311 (commented out):
- *   MCLK=13, SCLK=12, LRCK=10, DOUT=9, DIN=11
- */
-#define I2S_MCLK_GPIO       13
-#define I2S_SCLK_GPIO       36   /* BCLK -> external DAC */
-#define I2S_LRCK_GPIO       33   /* LRCLK -> external DAC */
-#define I2S_DOUT_GPIO       32   /* Data out -> external DAC */
-#define I2S_DIN_GPIO        21   /* Data in <- external ADC */
-/* Onboard ES8311 pins (restore for built-in codec):
- * #define I2S_SCLK_GPIO    12
- * #define I2S_LRCK_GPIO    10
- * #define I2S_DOUT_GPIO     9
- * #define I2S_DIN_GPIO     11
- */
+/* I2S and amplifier pins come from menuconfig ("AES67 Example"):
+ * onboard ES8311 (ESP32-P4-NANO / ESP32-P4-ETH): MCLK 13, BCLK 12, LRCK 10,
+ * DOUT 9, DIN 11, PA 53; or an external I2S DAC/ADC on header pins. */
+#define I2S_MCLK_GPIO       CONFIG_EXAMPLE_I2S_MCLK_GPIO
+#define I2S_SCLK_GPIO       CONFIG_EXAMPLE_I2S_BCLK_GPIO
+#define I2S_LRCK_GPIO       CONFIG_EXAMPLE_I2S_LRCK_GPIO
+#define I2S_DOUT_GPIO       CONFIG_EXAMPLE_I2S_DOUT_GPIO
+#define I2S_DIN_GPIO        CONFIG_EXAMPLE_I2S_DIN_GPIO
 
 /* Power amplifier enable (active high) */
-#define PA_CTRL_GPIO        53
+#define PA_CTRL_GPIO        CONFIG_EXAMPLE_PA_CTRL_GPIO
 
 /* I2C for ES8311 codec control */
 #define I2C_SCL_GPIO        8
@@ -437,6 +426,9 @@ static esp_err_t ethernet_init(esp_eth_handle_t *out_eth_handle)
 /* Enable the power amplifier on the ES8311 output stage */
 static void pa_ctrl_enable(void)
 {
+    if (PA_CTRL_GPIO < 0) {
+        return;
+    }
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PA_CTRL_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -656,8 +648,23 @@ void app_main(void)
         }
     }
 
-    /* Source stream is created in the SAP callback to match the
-     * discovered sink's codec and channel count. */
+#if CONFIG_EXAMPLE_CREATE_MIC_SOURCE
+    /* Create a mic source at boot so receivers (e.g. an AES67 speaker)
+     * can subscribe without any remote source being present. The ES8311
+     * ADC is mono; the stream is stereo L24 at the default 1 ms ptime.
+     * The SAP callback may add a second, codec-matched source later. */
+    {
+        uint8_t src_id = 0;
+        esp_err_t src_err = aes67_session_add_source(session, CONFIG_EXAMPLE_MIC_SOURCE_NAME,
+                                                     2, AES67_CODEC_L24, &src_id);
+        if (src_err == ESP_OK) {
+            ESP_LOGI(TAG, "Mic source \"%s\" created (id=%u): 2ch L24, announced via SAP",
+                     CONFIG_EXAMPLE_MIC_SOURCE_NAME, src_id);
+        } else {
+            ESP_LOGE(TAG, "Mic source create failed: %s", esp_err_to_name(src_err));
+        }
+    }
+#endif
 
     /* Start the WebUI (HTTP + WebSocket) on port 80 */
     #include "aes67_webui.h"

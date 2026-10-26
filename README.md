@@ -94,8 +94,12 @@ The example targets the **ESP32-P4-NANO** board with:
 | I2C SDA | 7 | ES8311 control |
 
 - Ethernet PHY: IP101 GRI via RMII
-- Onboard audio codec: ES8311 + NS4150B amplifier
-- External I2S DAC supported (pin remapping in main.c)
+- Onboard audio codec: ES8311 + NS4150B amplifier (mono ADC, mono DAC)
+- External I2S DAC supported: select it and its pins under `idf.py menuconfig`
+  -> "AES67 Example"
+
+The Waveshare **ESP32-P4-ETH** (with or without the PoE module) has the same
+Ethernet and codec pinout and works unchanged.
 
 ## Build
 

@@ -1,0 +1,59 @@
+menu "AES67 Example"
+
+    choice EXAMPLE_AUDIO_CODEC
+        prompt "Audio codec / I2S wiring"
+        default EXAMPLE_CODEC_ONBOARD_ES8311
+        help
+            Which I2S pins the example drives. The onboard ES8311 pinout is shared by
+            the Waveshare ESP32-P4-NANO and ESP32-P4-ETH boards. "External I2S DAC"
+            uses header pins and keeps the ES8311 I2C init (harmless if absent).
+
+        config EXAMPLE_CODEC_ONBOARD_ES8311
+            bool "Onboard ES8311 codec (ESP32-P4-NANO / ESP32-P4-ETH)"
+        config EXAMPLE_CODEC_EXTERNAL_I2S
+            bool "External I2S DAC/ADC on header pins"
+    endchoice
+
+    config EXAMPLE_I2S_MCLK_GPIO
+        int "I2S MCLK GPIO"
+        default 13
+
+    config EXAMPLE_I2S_BCLK_GPIO
+        int "I2S BCLK GPIO"
+        default 12 if EXAMPLE_CODEC_ONBOARD_ES8311
+        default 36
+
+    config EXAMPLE_I2S_LRCK_GPIO
+        int "I2S LRCK/WS GPIO"
+        default 10 if EXAMPLE_CODEC_ONBOARD_ES8311
+        default 33
+
+    config EXAMPLE_I2S_DOUT_GPIO
+        int "I2S data out GPIO (to DAC)"
+        default 9 if EXAMPLE_CODEC_ONBOARD_ES8311
+        default 32
+
+    config EXAMPLE_I2S_DIN_GPIO
+        int "I2S data in GPIO (from ADC)"
+        default 11 if EXAMPLE_CODEC_ONBOARD_ES8311
+        default 21
+
+    config EXAMPLE_PA_CTRL_GPIO
+        int "Power amplifier enable GPIO (-1 to disable)"
+        default 53
+
+    config EXAMPLE_CREATE_MIC_SOURCE
+        bool "Create a microphone source stream at boot"
+        default y
+        help
+            Announce a stereo L24 source carrying the codec ADC input as soon as the
+            node is up, so AES67 receivers can subscribe without any other sender on
+            the network. The SAP discovery callback may still add a second,
+            codec-matched source when a remote source is found.
+
+    config EXAMPLE_MIC_SOURCE_NAME
+        string "Microphone source name (SDP s= line)"
+        depends on EXAMPLE_CREATE_MIC_SOURCE
+        default "ESP32-P4 Mic"
+
+endmenu
