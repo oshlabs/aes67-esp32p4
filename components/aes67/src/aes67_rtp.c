@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "lwip/udp.h"
 #include "lwip/pbuf.h"
@@ -75,7 +76,23 @@ struct aes67_rtp_stream {
     /* Jitter measurement for RX */
     int64_t last_rx_time_us;    /* Timestamp of last received packet in microseconds */
     int32_t jitter_us;          /* Estimated inter-packet jitter in microseconds */
+    /* Output routing: which stream channel feeds each of the two I2S slots */
+    uint8_t out_map[2];
 };
+
+/* Receive lookup table consulted by the Ethernet frame path. Entries are
+ * maintained under rx_lock by stream add/remove; the frame path holds the
+ * same spinlock while it matches, decodes and updates statistics, so a
+ * removal can never free a stream the frame path is using. */
+typedef struct {
+    uint32_t dest_ip;               /* network order */
+    uint16_t dest_port;             /* host order */
+    uint8_t  payload_type;
+    struct aes67_rtp_stream *stream;
+} rx_table_entry_t;
+
+#define RX_SCRATCH_FRAMES 192       /* 4 ms at 48 kHz, the AES67 practical maximum */
+#define RX_ACTIVE_WINDOW_US 500000  /* "receiving" if a packet arrived within this */
 
 /* Internal engine structure */
 struct aes67_rtp_engine {
@@ -99,6 +116,16 @@ struct aes67_rtp_engine {
     TaskHandle_t playback_notify_task;
     /* Stream buffer for decoupling RTP RX from I2S DMA */
     StreamBufferHandle_t audio_stream_buf;
+    /* Where decoded sink audio goes (audio_stream_buf unless redirected) */
+    StreamBufferHandle_t playout_buf;
+
+    /* Ethernet frame receive path */
+    portMUX_TYPE rx_lock;
+    rx_table_entry_t rx_table[AES67_MAX_STREAMS];
+    int32_t *rx_scratch;            /* RX_SCRATCH_FRAMES x max channels, internal */
+    int32_t *rx_out;                /* RX_SCRATCH_FRAMES x 2 slots, internal */
+    int32_t *tx_scratch;            /* capture routing for non-stereo sources */
+    aes67_rtp_rx_stats_t rx_stats;
     /* Raw lwIP UDP PCB -- processes packets directly in lwIP context,
      * bypassing socket layer and its ~412us per-packet overhead. */
     struct udp_pcb *raw_pcb;
@@ -591,8 +618,8 @@ static void rx_task_func(void *arg)
         stream->convert_from_net(payload, sample_buf, frames, channels);
 
         /* Route converted int32 samples to stream buffer or jitter buffer */
-        if (engine->audio_stream_buf) {
-            xStreamBufferSend(engine->audio_stream_buf, sample_buf,
+        if (engine->playout_buf) {
+            xStreamBufferSend(engine->playout_buf, sample_buf,
                                frames * channels * sizeof(int32_t), 0);
         } else {
             uint32_t data_bytes = frames * channels * sizeof(int32_t);
@@ -705,6 +732,27 @@ esp_err_t aes67_rtp_engine_init(const aes67_net_config_t *net_config,
     if (!engine->audio_stream_buf) {
         ESP_LOGE(TAG, "Failed to create audio stream buffer");
     }
+    engine->playout_buf = engine->audio_stream_buf;
+
+    portMUX_INITIALIZE(&engine->rx_lock);
+    engine->rx_scratch = heap_caps_malloc(
+        RX_SCRATCH_FRAMES * CONFIG_AES67_MAX_CHANNELS_PER_STREAM * sizeof(int32_t),
+        MALLOC_CAP_INTERNAL);
+    engine->rx_out = heap_caps_malloc(RX_SCRATCH_FRAMES * 2 * sizeof(int32_t), MALLOC_CAP_INTERNAL);
+    engine->tx_scratch = heap_caps_malloc(
+        RX_SCRATCH_FRAMES * CONFIG_AES67_MAX_CHANNELS_PER_STREAM * sizeof(int32_t),
+        MALLOC_CAP_INTERNAL);
+    if (!engine->rx_scratch || !engine->rx_out || !engine->tx_scratch) {
+        ESP_LOGE(TAG, "Failed to allocate frame scratch buffers");
+        heap_caps_free(engine->rx_scratch);
+        heap_caps_free(engine->rx_out);
+        heap_caps_free(engine->tx_scratch);
+        if (engine->audio_stream_buf) vStreamBufferDelete(engine->audio_stream_buf);
+        vSemaphoreDelete(engine->lock);
+        vSemaphoreDelete(engine->rx_done);
+        free(engine);
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Create the RX socket only if raw PCB is not active.
      * Raw PCB already binds to the port, so socket bind would fail. */
@@ -714,6 +762,9 @@ esp_err_t aes67_rtp_engine_init(const aes67_net_config_t *net_config,
             ESP_LOGE(TAG, "Failed to create RX socket on port %u",
                      net_config->rtp_port);
             if (engine->audio_stream_buf) vStreamBufferDelete(engine->audio_stream_buf);
+            heap_caps_free(engine->rx_scratch);
+            heap_caps_free(engine->rx_out);
+            heap_caps_free(engine->tx_scratch);
             vSemaphoreDelete(engine->lock);
             vSemaphoreDelete(engine->rx_done);
             free(engine);
@@ -852,6 +903,9 @@ esp_err_t aes67_rtp_engine_destroy(aes67_rtp_engine_handle_t handle)
     if (engine->audio_stream_buf) {
         vStreamBufferDelete(engine->audio_stream_buf);
     }
+    heap_caps_free(engine->rx_scratch);
+    heap_caps_free(engine->rx_out);
+    heap_caps_free(engine->tx_scratch);
     vSemaphoreDelete(engine->lock);
     vSemaphoreDelete(engine->rx_done);
     free(engine);
@@ -967,10 +1021,32 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
         }
     }
 
+    /* Output routing to the two I2S slots: routing[] names the stream
+     * channel for each slot when it is in range; a mono stream feeds both
+     * slots; otherwise channels 0 and 1. */
+    for (int k = 0; k < 2; k++) {
+        uint8_t r = config->routing[k];
+        if (config->channels == 1) {
+            s->out_map[k] = 0;
+        } else if (r < config->channels) {
+            s->out_map[k] = r;
+        } else {
+            s->out_map[k] = (uint8_t)(k < config->channels ? k : 0);
+        }
+    }
+
     s->active = true;
     engine->streams[slot] = s;
     engine->stream_count++;
     *stream = s;
+    if (s->direction == AES67_STREAM_SINK) {
+        portENTER_CRITICAL(&engine->rx_lock);
+        engine->rx_table[slot].dest_ip = config->dest_ip;
+        engine->rx_table[slot].dest_port = config->dest_port;
+        engine->rx_table[slot].payload_type = config->payload_type;
+        engine->rx_table[slot].stream = s;
+        portEXIT_CRITICAL(&engine->rx_lock);
+    }
     engine_unlock(engine);
 
     char ip_str[16];
@@ -1009,6 +1085,11 @@ esp_err_t aes67_rtp_stream_remove(aes67_rtp_engine_handle_t engine_handle,
     if (slot >= 0) {
         s->active = false;
         engine->stream_count--;
+        /* The frame path holds rx_lock across its use of the entry, so
+         * after this nobody reaches s through the table. */
+        portENTER_CRITICAL(&engine->rx_lock);
+        engine->rx_table[slot].stream = NULL;
+        portEXIT_CRITICAL(&engine->rx_lock);
     }
     engine_unlock(engine);
     if (slot < 0) {
@@ -1044,6 +1125,15 @@ esp_err_t aes67_rtp_stream_get_status(aes67_rtp_stream_handle_t stream,
     }
 
     memcpy(status, &stream->status, sizeof(aes67_rtp_stream_status_t));
+    status->ssrc = stream->ssrc;
+    if (stream->direction == AES67_STREAM_SINK) {
+        int64_t now = esp_timer_get_time();
+        if (stream->last_rx_time_us > 0 && now - stream->last_rx_time_us < RX_ACTIVE_WINDOW_US) {
+            status->status_flags |= AES67_RTP_STATUS_RECEIVING;
+        } else {
+            status->status_flags &= ~AES67_RTP_STATUS_RECEIVING;
+        }
+    }
     return ESP_OK;
 }
 
@@ -1073,6 +1163,184 @@ esp_err_t aes67_rtp_source_write(aes67_rtp_stream_handle_t stream,
     return ESP_OK;
 }
 
+esp_err_t aes67_rtp_engine_set_playout_buf(aes67_rtp_engine_handle_t handle,
+                                           StreamBufferHandle_t sbuf)
+{
+    if (!handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    handle->playout_buf = sbuf ? sbuf : handle->audio_stream_buf;
+    return ESP_OK;
+}
+
+esp_err_t aes67_rtp_engine_get_rx_stats(aes67_rtp_engine_handle_t handle,
+                                        aes67_rtp_rx_stats_t *stats)
+{
+    if (!handle || !stats) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *stats = handle->rx_stats;
+    return ESP_OK;
+}
+
+/*
+ * Ethernet frame receive path. Runs in the Ethernet driver's task for every
+ * frame, so the common case (not ours) must be a few comparisons. Headers
+ * are validated in order: Ethernet type, IPv4 header and total length, UDP
+ * length, then RTP fixed header, CSRC list, extension and padding, every
+ * offset checked against the UDP payload end.
+ */
+bool IRAM_ATTR aes67_rtp_engine_rx_frame(aes67_rtp_engine_handle_t handle,
+                                         const uint8_t *frame, uint32_t len)
+{
+    struct aes67_rtp_engine *engine = handle;
+    if (!engine || len < 14 + 20 + 8 + 12) {
+        return false;
+    }
+    if (frame[12] != 0x08 || frame[13] != 0x00) {
+        return false;                                   /* not IPv4 */
+    }
+    const uint8_t *ip = frame + 14;
+    uint32_t ihl = (ip[0] & 0x0F) * 4;
+    if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17) {
+        return false;                                   /* not UDP */
+    }
+    if ((ip[16] & 0xF0) != 0xE0) {
+        return false;                                   /* not multicast */
+    }
+    uint32_t ip_total = ((uint32_t)ip[2] << 8) | ip[3];
+    if (ip_total < ihl + 8 || 14 + ip_total > len) {
+        return false;
+    }
+    const uint8_t *udp = ip + ihl;
+    uint16_t dport = (uint16_t)((udp[2] << 8) | udp[3]);
+    uint32_t udp_len = ((uint32_t)udp[4] << 8) | udp[5];
+    if (udp_len < 8 + 12 || udp_len > ip_total - ihl) {
+        return false;
+    }
+    const uint8_t *rtp = udp + 8;
+    uint32_t rtp_len = udp_len - 8;                     /* RTP header + payload */
+    if ((rtp[0] >> 6) != 2) {
+        return false;                                   /* not RTP v2 */
+    }
+    uint32_t dst_ip;
+    memcpy(&dst_ip, ip + 16, 4);                        /* network order */
+    uint8_t pt = rtp[1] & 0x7F;
+
+    /* Match group, port and payload type; everything below runs under the
+     * spinlock so the stream cannot be removed meanwhile. */
+    portENTER_CRITICAL(&engine->rx_lock);
+    struct aes67_rtp_stream *s = NULL;
+    for (int i = 0; i < AES67_MAX_STREAMS; i++) {
+        rx_table_entry_t *e = &engine->rx_table[i];
+        if (e->stream && e->dest_ip == dst_ip && e->dest_port == dport) {
+            if (e->payload_type == pt) {
+                s = e->stream;
+            }
+            break;
+        }
+    }
+    if (!s) {
+        portEXIT_CRITICAL(&engine->rx_lock);
+        engine->rx_stats.rtp_unmatched++;
+        return false;                                   /* let lwIP have it */
+    }
+
+    /* RTP header: CSRC list, extension, padding */
+    uint32_t cc = rtp[0] & 0x0F;
+    uint32_t hdr_len = 12 + cc * 4;
+    if (rtp[0] & 0x10) {                                /* extension */
+        if (hdr_len + 4 > rtp_len) goto malformed;
+        uint32_t ext_words = ((uint32_t)rtp[hdr_len + 2] << 8) | rtp[hdr_len + 3];
+        hdr_len += 4 + ext_words * 4;
+    }
+    if (hdr_len >= rtp_len) goto malformed;
+    uint32_t payload_len = rtp_len - hdr_len;
+    if (rtp[0] & 0x20) {                                /* padding: last payload byte */
+        uint32_t pad = rtp[rtp_len - 1];
+        if (pad == 0 || pad > payload_len) goto malformed;
+        payload_len -= pad;
+    }
+    const uint8_t *payload = rtp + hdr_len;
+
+    uint32_t ssrc = ((uint32_t)rtp[8] << 24) | ((uint32_t)rtp[9] << 16) |
+                    ((uint32_t)rtp[10] << 8) | rtp[11];
+    uint16_t seq = (uint16_t)((rtp[2] << 8) | rtp[3]);
+    uint32_t ts = ((uint32_t)rtp[4] << 24) | ((uint32_t)rtp[5] << 16) |
+                  ((uint32_t)rtp[6] << 8) | rtp[7];
+
+    /* SSRC: lock to the first sender on this group, then stay with it */
+    if (s->first_packet) {
+        s->ssrc = ssrc;
+        s->first_packet = false;
+    } else if (s->ssrc != ssrc) {
+        s->status.ssrc_mismatches++;
+        s->status.status_flags |= AES67_RTP_STATUS_SSRC_ERROR;
+        engine->rx_stats.ssrc_rejected++;
+        portEXIT_CRITICAL(&engine->rx_lock);
+        return true;                                    /* ours, but not this sender */
+    }
+
+    uint8_t channels = s->config.channels;
+    uint8_t wl = s->config.word_length;
+    uint32_t frame_bytes = (uint32_t)channels * wl;
+    if (frame_bytes == 0 || payload_len < frame_bytes) goto malformed;
+    uint32_t frames = payload_len / frame_bytes;
+    if (frames > RX_SCRATCH_FRAMES) frames = RX_SCRATCH_FRAMES;
+
+    /* Statistics: sequence, loss, inter-arrival jitter */
+    int64_t now_us = esp_timer_get_time();
+    if (s->status.packets_received > 0) {
+        uint16_t expected = (uint16_t)(s->status.last_seq + 1);
+        if (seq != expected) {
+            int16_t diff = (int16_t)(seq - expected);
+            if (diff > 0) s->status.packets_lost += diff;
+            s->status.seq_errors++;
+            s->status.status_flags |= AES67_RTP_STATUS_SEQ_ERROR;
+        }
+        if (s->last_rx_time_us > 0) {
+            int64_t expected_us = (int64_t)s->samples_per_packet * 1000000LL /
+                                  s->config.sample_rate;
+            int32_t dev = (int32_t)((now_us - s->last_rx_time_us) - expected_us);
+            if (dev < 0) dev = -dev;
+            s->jitter_us += (dev - s->jitter_us) / 16;
+            s->status.jitter_us = s->jitter_us;
+        }
+    }
+    s->status.last_seq = seq;
+    s->status.last_rtp_timestamp = ts;
+    s->status.packets_received++;
+    s->status.bytes_received += payload_len;
+    s->last_rx_time_us = now_us;
+
+    /* Decode to int32 and route stream channels onto the two output slots */
+    s->convert_from_net(payload, engine->rx_scratch, frames, channels);
+    const int32_t *in = engine->rx_scratch;
+    int32_t *out = engine->rx_out;
+    uint8_t m0 = s->out_map[0], m1 = s->out_map[1];
+    for (uint32_t f = 0; f < frames; f++) {
+        out[2 * f]     = in[f * channels + m0];
+        out[2 * f + 1] = in[f * channels + m1];
+    }
+    StreamBufferHandle_t sbuf = engine->playout_buf;
+    portEXIT_CRITICAL(&engine->rx_lock);
+
+    engine->rx_stats.rtp_consumed++;
+    if (sbuf) {
+        size_t bytes = frames * 2 * sizeof(int32_t);
+        if (xStreamBufferSend(sbuf, engine->rx_out, bytes, 0) < bytes) {
+            engine->rx_stats.playout_overflow++;
+        }
+    }
+    return true;
+
+malformed:
+    s->status.status_flags |= AES67_RTP_STATUS_PT_ERROR;
+    portEXIT_CRITICAL(&engine->rx_lock);
+    engine->rx_stats.rtp_malformed++;
+    return true;                                        /* ours, drop it */
+}
+
 esp_err_t aes67_rtp_engine_feed_capture(aes67_rtp_engine_handle_t handle,
                                         const int32_t *samples, uint32_t frame_count)
 {
@@ -1081,14 +1349,32 @@ esp_err_t aes67_rtp_engine_feed_capture(aes67_rtp_engine_handle_t handle,
     }
     struct aes67_rtp_engine *engine = handle;
 
+    if (frame_count > RX_SCRATCH_FRAMES) {
+        frame_count = RX_SCRATCH_FRAMES;
+    }
+
     engine_lock(engine);
     for (int i = 0; i < AES67_MAX_STREAMS; i++) {
         struct aes67_rtp_stream *s = engine->streams[i];
         if (!s || s->direction != AES67_STREAM_SOURCE || !s->active) {
             continue;
         }
-        uint32_t byte_count = frame_count * s->config.channels * sizeof(int32_t);
-        uint32_t written = ringbuf_write(&s->ring, (const uint8_t *)samples, byte_count);
+        uint8_t ch = s->config.channels;
+        const int32_t *src = samples;
+        if (ch != 2) {
+            /* Capture is two slots; a mono source takes the left slot, a
+             * wider source gets the two slots in channels 0 and 1 and
+             * silence in the rest. */
+            int32_t *dst = engine->tx_scratch;
+            for (uint32_t f = 0; f < frame_count; f++) {
+                for (uint8_t c = 0; c < ch; c++) {
+                    dst[f * ch + c] = (c < 2) ? samples[2 * f + c] : 0;
+                }
+            }
+            src = dst;
+        }
+        uint32_t byte_count = frame_count * ch * sizeof(int32_t);
+        uint32_t written = ringbuf_write(&s->ring, (const uint8_t *)src, byte_count);
         if (written < byte_count) {
             s->status.status_flags |= AES67_RTP_STATUS_OVERFLOW;
         }

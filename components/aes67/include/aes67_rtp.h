@@ -79,7 +79,19 @@ typedef struct {
     int32_t  jitter_us;             /* Estimated jitter in microseconds */
     uint32_t last_rtp_timestamp;    /* Last RTP timestamp processed */
     uint16_t last_seq;              /* Last sequence number */
+    uint32_t bytes_received;        /* Payload bytes decoded (sinks) */
+    uint32_t ssrc_mismatches;       /* Packets on the group with another SSRC */
+    uint32_t ssrc;                  /* SSRC the sink is locked to (0 = none yet) */
 } aes67_rtp_stream_status_t;
+
+/* Counters of the engine's Ethernet-frame receive path */
+typedef struct {
+    uint32_t rtp_consumed;          /* RTP frames decoded into a sink */
+    uint32_t rtp_unmatched;         /* RTP on an unknown group/port, forwarded */
+    uint32_t rtp_malformed;         /* RTP that failed header validation */
+    uint32_t ssrc_rejected;         /* RTP for a sink locked to another SSRC */
+    uint32_t playout_overflow;      /* Decoded frames that did not fit the playout buffer */
+} aes67_rtp_rx_stats_t;
 
 /* Opaque stream handle */
 typedef struct aes67_rtp_stream *aes67_rtp_stream_handle_t;
@@ -151,6 +163,28 @@ esp_err_t aes67_rtp_source_write(aes67_rtp_stream_handle_t stream,
  */
 esp_err_t aes67_rtp_sink_read(aes67_rtp_stream_handle_t stream,
                               void *samples, uint32_t frame_count);
+
+/**
+ * Offer a received Ethernet frame to the engine. If it is RTP for one of the
+ * active sinks (matched on destination group and port), it is validated,
+ * decoded, routed to the two output slots and written to the playout
+ * buffer, and the sink's statistics are updated. Safe to call from the
+ * Ethernet driver's input path. Returns true when the frame was consumed:
+ * the caller frees it and does not forward it to lwIP.
+ */
+bool aes67_rtp_engine_rx_frame(aes67_rtp_engine_handle_t handle,
+                               const uint8_t *frame, uint32_t len);
+
+/**
+ * Where decoded sink audio goes: two-slot interleaved int32 frames. The
+ * node points this at the audio driver's playout buffer in I2S mode; by
+ * default it is the engine's own buffer, read by the playback task.
+ */
+esp_err_t aes67_rtp_engine_set_playout_buf(aes67_rtp_engine_handle_t handle,
+                                           StreamBufferHandle_t sbuf);
+
+esp_err_t aes67_rtp_engine_get_rx_stats(aes67_rtp_engine_handle_t handle,
+                                        aes67_rtp_rx_stats_t *stats);
 
 /**
  * Write captured audio (interleaved int32, frame_count frames) into every
