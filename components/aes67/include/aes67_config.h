@@ -181,6 +181,7 @@ typedef struct {
     bool use_psram;                     /* Allocate large buffers in PSRAM */
     bool sap_enabled;                   /* Enable SAP announcements */
     bool mdns_enabled;                  /* Enable mDNS advertisement */
+    bool eth_rx_hook;                   /* Take PTP and RTP off the Ethernet input path before lwIP (default) */
 
     /* Output routing */
     aes67_output_mode_t output_mode;    /* How to deliver received audio */
@@ -223,6 +224,7 @@ typedef struct {
     .use_psram = true, \
     .sap_enabled = true, \
     .mdns_enabled = true, \
+    .eth_rx_hook = true, \
     .output_mode = AES67_OUTPUT_I2S, \
     .audio_cb = NULL, \
     .audio_cb_user_data = NULL, \

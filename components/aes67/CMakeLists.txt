@@ -11,7 +11,7 @@ idf_component_register(
         "src/aes67_net.c"
         "src/aes67_mdns.c"
         "src/aes67_hw_timer.c"
-        "src/aes67_l2tap_rx.c"
+        "src/aes67_eth_rx.c"
         "src/aes67_webui.c"
         # Bundled third-party: a minimal IEEE-1588 PTP daemon (Apache NuttX
         # ptpd, ported to ESP-IDF by Espressif) and the EMAC time wrapper from

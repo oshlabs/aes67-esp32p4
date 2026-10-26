@@ -20,6 +20,8 @@
 #include "aes67_session.h"
 #include "aes67_hw_timer.h"
 #include "aes67_net.h"
+#include "aes67_eth_rx.h"
+#include "aes67_audio.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -58,7 +60,6 @@ struct aes67_node {
     TaskHandle_t                pb_task;
     SemaphoreHandle_t           tic_done;   /* given by the TIC task on exit */
     SemaphoreHandle_t           pb_done;    /* given by the playback task on exit */
-    StreamBufferHandle_t        external_playout_buf;  /* optional, see aes67_node_set_playout_buf */
     bool                        running;
 };
 
@@ -227,9 +228,7 @@ static void playback_task(void *arg)
 
         /* Get the stream buffer: the optional external feed (e.g. an Rx-hook
          * integration) if one was registered, otherwise the RTP engine's. */
-        StreamBufferHandle_t sbuf = node->external_playout_buf ?
-                                     node->external_playout_buf :
-                                     aes67_rtp_engine_get_stream_buf(node->rtp);
+        StreamBufferHandle_t sbuf = aes67_rtp_engine_get_stream_buf(node->rtp);
         if (!sbuf) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -524,9 +523,22 @@ esp_err_t aes67_node_start(aes67_node_handle_t handle)
 
     handle->running = true;
 
-    /* Enable direct RTP RX -> staging ring path */
-    aes67_rtp_engine_set_playback(handle->rtp, handle->audio);
-    ESP_LOGI(TAG, "Direct RTP->I2S path enabled (zero-buffer)");
+    /* Decoded sink audio: straight into the audio driver's playout buffer
+     * in I2S mode (the DMA ISR reads it); otherwise the engine's own buffer,
+     * which the playback task hands to the callback or the application. */
+    aes67_rtp_engine_set_playout_buf(handle->rtp,
+        handle->config.output_mode == AES67_OUTPUT_I2S
+            ? aes67_audio_get_playout_buf(handle->audio) : NULL);
+
+    /* Take PTP and RTP off the Ethernet input path before lwIP */
+    if (handle->config.eth_rx_hook) {
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey(handle->config.net.interface_name);
+        ret = aes67_eth_rx_install(handle->config.net.eth_handle, netif, handle->rtp, handle->ptp);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Ethernet receive hook not installed: %s (socket path only)",
+                     esp_err_to_name(ret));
+        }
+    }
 
     /* Playback task: only needed for callback/stream_buffer output modes.
      * For I2S mode, the DMA ISR reads directly from the stream buffer,
@@ -574,6 +586,9 @@ esp_err_t aes67_node_stop(aes67_node_handle_t handle)
         ESP_LOGW(TAG, "node not running");
         return ESP_OK;
     }
+
+    /* Stop feeding the engine and daemon from the Ethernet path first */
+    aes67_eth_rx_disable();
 
     /* Stop the frame timer and let the TIC and playback tasks leave their
      * loops before any subsystem they use is stopped. */
@@ -717,10 +732,26 @@ esp_err_t aes67_node_get_rtp(aes67_node_handle_t handle,
 esp_err_t aes67_node_set_playout_buf(aes67_node_handle_t handle,
                                       StreamBufferHandle_t sbuf)
 {
-    if (!handle) {
+    (void)sbuf;
+    return handle ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
+esp_err_t aes67_node_get_rx_stats(aes67_node_handle_t handle, aes67_node_rx_stats_t *stats)
+{
+    if (!handle || !stats) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    handle->external_playout_buf = sbuf;
+    aes67_eth_rx_stats_t hook = {0};
+    aes67_rtp_rx_stats_t rtp = {0};
+    aes67_eth_rx_get_stats(&hook);
+    aes67_rtp_engine_get_rx_stats(handle->rtp, &rtp);
+    stats->frames_seen = hook.frames_seen;
+    stats->frames_forwarded = hook.frames_forwarded;
+    stats->ptp_consumed = hook.ptp_consumed;
+    stats->rtp_consumed = rtp.rtp_consumed;
+    stats->rtp_unmatched = rtp.rtp_unmatched;
+    stats->rtp_malformed = rtp.rtp_malformed;
+    stats->ssrc_rejected = rtp.ssrc_rejected;
+    stats->playout_overflow = rtp.playout_overflow;
     return ESP_OK;
 }

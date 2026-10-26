@@ -113,17 +113,22 @@ esp_err_t aes67_node_get_ptp(aes67_node_handle_t handle,
 esp_err_t aes67_node_get_rtp(aes67_node_handle_t handle,
                               aes67_rtp_engine_handle_t *rtp);
 
+/* Receive-path counters: the Ethernet hook and the RTP engine's decoder */
+typedef struct {
+    uint32_t frames_seen;           /* every frame the driver delivered */
+    uint32_t frames_forwarded;      /* handed to lwIP */
+    uint32_t ptp_consumed;          /* PTP/UDP taken by the daemon with hardware stamps */
+    uint32_t rtp_consumed;          /* RTP decoded into a sink */
+    uint32_t rtp_unmatched;         /* RTP for no sink, forwarded */
+    uint32_t rtp_malformed;         /* RTP that failed validation */
+    uint32_t ssrc_rejected;         /* RTP from a second sender on a sink's group */
+    uint32_t playout_overflow;      /* decoded packets the playout buffer could not take */
+} aes67_node_rx_stats_t;
+
+esp_err_t aes67_node_get_rx_stats(aes67_node_handle_t handle, aes67_node_rx_stats_t *stats);
+
 /**
- * Provide an external playout stream buffer for the node's playback task.
- *
- * By default the playback task consumes audio from the RTP engine's own
- * stream buffer. An integration that intercepts RTP frames earlier (for
- * example, an esp_eth Rx hook that parses audio in the driver callback and
- * feeds it in directly) can register its own buffer here; when set and
- * non-NULL, the playback task reads from it instead. Pass NULL to clear.
- *
- * Optional. Call before aes67_node_start(); has no effect on the ISR-driven
- * I2S path, which is fed via aes67_audio_slot_write().
+ * Deprecated and ignored: the node now owns the receive path. Will be removed.
  */
 esp_err_t aes67_node_set_playout_buf(aes67_node_handle_t handle,
                                       StreamBufferHandle_t sbuf);
