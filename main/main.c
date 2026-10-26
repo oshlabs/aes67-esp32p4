@@ -47,6 +47,8 @@
 #include "esp_ldo_regulator.h"
 #include "driver/i2s_std.h"
 #include "es8311.h"
+#include "nvs.h"
+#include "aes67_webui.h"
 
 /* Session handle for SAP callback */
 static aes67_session_handle_t s_session = NULL;
@@ -441,6 +443,93 @@ static void pa_ctrl_enable(void)
     ESP_LOGI(TAG, "PA enabled (GPIO%d high)", PA_CTRL_GPIO);
 }
 
+/* ---- Codec settings: menuconfig defaults, overridden by values saved in
+ * NVS, adjustable at runtime through the Web UI controls. ---- */
+
+static es8311_handle_t s_codec = NULL;
+static int32_t s_mic_gain_db = CONFIG_EXAMPLE_MIC_GAIN_DB;
+static int32_t s_volume = CONFIG_EXAMPLE_SPEAKER_VOLUME;
+
+#define SETTINGS_NS "aes67ex"
+
+static void settings_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    int32_t v;
+    if (nvs_get_i32(h, "mic_gain", &v) == ESP_OK && v >= 0 && v <= 42) {
+        s_mic_gain_db = (v / 6) * 6;
+    }
+    if (nvs_get_i32(h, "volume", &v) == ESP_OK && v >= 0 && v <= 100) {
+        s_volume = v;
+    }
+    nvs_close(h);
+}
+
+static void settings_save(const char *key, int32_t value)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, key, value);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static esp_err_t apply_mic_gain(int32_t db)
+{
+    if (!s_codec) return ESP_ERR_INVALID_STATE;
+    return es8311_microphone_gain_set(s_codec, (es8311_mic_gain_t)(ES8311_MIC_GAIN_0DB + db / 6));
+}
+
+static esp_err_t apply_volume(int32_t vol)
+{
+    if (!s_codec) return ESP_ERR_INVALID_STATE;
+    return es8311_voice_volume_set(s_codec, (int)vol, NULL);
+}
+
+/* Web UI control callbacks */
+static esp_err_t ctl_mic_gain_get(void *ud, int32_t *v) { *v = s_mic_gain_db; return ESP_OK; }
+static esp_err_t ctl_mic_gain_set(void *ud, int32_t v)
+{
+    esp_err_t err = apply_mic_gain(v);
+    if (err == ESP_OK) {
+        s_mic_gain_db = v;
+        settings_save("mic_gain", v);
+        ESP_LOGI(TAG, "mic gain set to %ld dB", (long)v);
+    }
+    return err;
+}
+static esp_err_t ctl_volume_get(void *ud, int32_t *v) { *v = s_volume; return ESP_OK; }
+static esp_err_t ctl_volume_set(void *ud, int32_t v)
+{
+    esp_err_t err = apply_volume(v);
+    if (err == ESP_OK) {
+        s_volume = v;
+        settings_save("volume", v);
+        ESP_LOGI(TAG, "volume set to %ld", (long)v);
+    }
+    return err;
+}
+
+static void register_codec_controls(aes67_webui_handle_t webui)
+{
+    const aes67_webui_control_t mic = {
+        .name = "mic_gain", .label = "Mic gain", .unit = "dB",
+        .min = 0, .max = 42, .step = 6,
+        .get = ctl_mic_gain_get, .set = ctl_mic_gain_set,
+    };
+    const aes67_webui_control_t vol = {
+        .name = "volume", .label = "Speaker volume", .unit = "%",
+        .min = 0, .max = 100, .step = 1,
+        .get = ctl_volume_get, .set = ctl_volume_set,
+    };
+    aes67_webui_add_control(webui, &mic);
+    aes67_webui_add_control(webui, &vol);
+}
+
 /*
  * Initialize the ES8311 audio codec via I2C.
  * Configures it for 48kHz 24-bit I2S operation with both DAC (playback)
@@ -471,6 +560,7 @@ static esp_err_t es8311_codec_init(void)
 
     /* Create ES8311 codec handle */
     es8311_handle_t codec = es8311_create(I2C_PORT, ES8311_ADDR);
+    s_codec = codec;
     if (!codec) {
         ESP_LOGE(TAG, "ES8311 create failed");
         return ESP_FAIL;
@@ -494,7 +584,7 @@ static esp_err_t es8311_codec_init(void)
         return ret;
     }
 
-    ret = es8311_voice_volume_set(codec, CONFIG_EXAMPLE_SPEAKER_VOLUME, NULL);
+    ret = es8311_voice_volume_set(codec, (int)s_volume, NULL);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ES8311 volume set failed: %s", esp_err_to_name(ret));
     }
@@ -505,12 +595,11 @@ static esp_err_t es8311_codec_init(void)
         ESP_LOGW(TAG, "ES8311 unmute failed: %s", esp_err_to_name(ret));
     }
 
-    /* Configure microphone: analog mic, gain from menuconfig (6 dB steps) */
+    /* Configure microphone: analog mic; gain and volume from NVS, else
+     * the menuconfig defaults (6 dB steps) */
     es8311_microphone_config(codec, false);
-    es8311_microphone_gain_set(codec,
-        (es8311_mic_gain_t)(ES8311_MIC_GAIN_0DB + CONFIG_EXAMPLE_MIC_GAIN_DB / 6));
-    ESP_LOGI(TAG, "ES8311 mic gain %d dB, volume %d",
-             (CONFIG_EXAMPLE_MIC_GAIN_DB / 6) * 6, CONFIG_EXAMPLE_SPEAKER_VOLUME);
+    apply_mic_gain(s_mic_gain_db);
+    ESP_LOGI(TAG, "ES8311 mic gain %ld dB, volume %ld", (long)s_mic_gain_db, (long)s_volume);
 
     /* Dump ES8311 register state for debugging */
     es8311_register_dump(codec);
@@ -529,6 +618,7 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    settings_load();
 
     /* Configure LDO4 to 3.3V for SDIO/SPI power domain.
      * Must be done early before any peripherals on this rail. */
@@ -670,9 +760,9 @@ void app_main(void)
 #endif
 
     /* Start the WebUI (HTTP + WebSocket) on port 80 */
-    #include "aes67_webui.h"
     aes67_webui_handle_t webui = NULL;
     if (aes67_webui_init(node, 80, &webui) == ESP_OK) {
+        register_codec_controls(webui);
         aes67_webui_start(webui);
     }
 
