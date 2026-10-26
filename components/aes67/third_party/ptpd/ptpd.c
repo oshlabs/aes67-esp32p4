@@ -244,7 +244,7 @@ struct ptp_state_s
     struct ptp_follow_up_s  follow_up;
     struct ptp_delay_req_s  delay_req;
     struct ptp_delay_resp_s delay_resp;
-    uint8_t                 raw[128];
+    uint8_t                 raw[256];   /* room for common TLVs */
   } rxbuf;
 
 #ifndef ESP_PTP
@@ -369,15 +369,25 @@ static int ptp_net_recv(FAR struct ptp_state_s *state, void *ptp_msg, uint16_t p
 
   int ret = read(state->ptp_socket, &ptp_msg_ext_buff, 0);
 
-  // check if read was successful, ts exists and ts_info is valid
-  if (ret > 0 && ts && ts_info->type == L2TAP_IREC_TIME_STAMP)
+  /* ret is the whole Ethernet frame length. Strip the header, and drop
+   * TLVs that do not fit the caller's buffer instead of writing past it
+   * (an Announce with PATH_TRACE or vendor TLVs is longer than the base
+   * message). */
+  if (ret <= ETH_HEADER_LEN)
+    {
+      return -1;
+    }
+  if (ts && ts_info->type == L2TAP_IREC_TIME_STAMP)
     {
       *ts = *(struct timespec *)ts_info->data;
     }
-
-  memcpy(ptp_msg, &eth_frame[ETH_HEADER_LEN], ret);
-
-  return ret;
+  int payload = ret - ETH_HEADER_LEN;
+  if (payload > ptp_msg_len)
+    {
+      payload = ptp_msg_len;
+    }
+  memcpy(ptp_msg, &eth_frame[ETH_HEADER_LEN], payload);
+  return payload;
 }
 
 static int64_t timespec_to_ns(FAR const struct timespec *ts)

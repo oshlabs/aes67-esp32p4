@@ -15,3 +15,7 @@ re-synced against a newer upstream:
   errno instead of a NULL dereference in a later `ptpd_status()`.
 - `ptpd_status()`: returns `-ESRCH` when no daemon runs; the status-request
   handoff is done under a spinlock and the daemon works on a local copy.
+- `ptp_net_recv()`: strips the Ethernet header from the returned length and
+  clamps the copy to the caller's buffer; frames longer than the receive
+  buffer (TLVs) used to overflow `rxbuf` into the two-step state. `rxbuf.raw`
+  grows to 256 bytes.
