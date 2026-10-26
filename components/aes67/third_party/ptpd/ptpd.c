@@ -447,23 +447,25 @@ static void ptp_format_to_timespec(FAR const uint8_t *timestamp,
  * Implements Best Master Clock algorithm from IEEE-1588.
  */
 
+/* Pack the data-set comparison fields of IEEE 1588-2008 9.3.2.5 in order:
+ * priority1, clock class, accuracy, variance (2 bytes), priority2, then the
+ * grandmaster identity as the tie-breaker. Lower compares as better. */
+static void pack_clock_key(FAR const struct ptp_announce_s *a, uint8_t key[15])
+{
+  key[0] = a->gm_priority1;
+  memcpy(&key[1], a->gm_quality, 4);
+  key[5] = a->gm_priority2;
+  memcpy(&key[6], a->gm_identity, 8);
+  key[14] = 0;
+}
+
 static bool is_better_clock(FAR const struct ptp_announce_s *a,
                             FAR const struct ptp_announce_s *b)
 {
-  if  (a->gm_priority1 < b->gm_priority1     /* Main priority field */
-    || a->gm_quality[0] < b->gm_quality[0]   /* Clock class */
-    || a->gm_quality[1] < b->gm_quality[1]   /* Clock accuracy */
-    || a->gm_quality[2] < b->gm_quality[2]   /* Clock variance high byte */
-    || a->gm_quality[3] < b->gm_quality[3]   /* Clock variance low byte */
-    || a->gm_priority2 < b->gm_priority2     /* Sub priority field */
-    || memcmp(a->gm_identity, b->gm_identity, sizeof(a->gm_identity)) < 0)
-    {
-      return true;
-    }
-    else
-    {
-      return false;
-    }
+  uint8_t ka[15], kb[15];
+  pack_clock_key(a, ka);
+  pack_clock_key(b, kb);
+  return memcmp(ka, kb, sizeof(ka)) < 0;
 }
 
 static int64_t timespec_to_ms(FAR const struct timespec *ts)

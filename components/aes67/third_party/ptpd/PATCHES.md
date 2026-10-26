@@ -19,3 +19,6 @@ re-synced against a newer upstream:
   clamps the copy to the caller's buffer; frames longer than the receive
   buffer (TLVs) used to overflow `rxbuf` into the two-step state. `rxbuf.raw`
   grows to 256 bytes.
+- `is_better_clock()`: compares the announce data set lexicographically
+  (priority1, class, accuracy, variance, priority2, identity) instead of
+  returning true when any single field is lower.
