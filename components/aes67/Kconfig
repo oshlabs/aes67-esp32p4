@@ -201,4 +201,13 @@ menu "AES67 RAVENNA Component"
         help
             TCP port for the embedded web server.
 
+    config AES67_WEBUI_PUSH_INTERVAL_MS
+        int "WebUI status push interval (ms)"
+        default 500
+        range 100 10000
+        depends on AES67_WEBUI_ENABLED
+        help
+            How often the status frame is sent to connected WebSocket clients.
+            Nothing is built or sent while no client is connected.
+
 endmenu

@@ -34,6 +34,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/sockets.h"
 
 static const char *TAG = "aes67_webui";
 
@@ -46,13 +47,24 @@ extern const uint8_t index_html_gz_end[]   asm("_binary_index_html_gz_end");
 
 /* ---- Context ---- */
 
+/* Copy-out buffers for the status builder. They are large (a sink embeds a
+ * 1 KB SDP, a SAP remote another 1 KB) and must not live on the server
+ * task's stack, so one set is allocated with the context. */
+struct webui_scratch {
+    aes67_source_t              src;
+    aes67_sink_t                sink;
+    aes67_sap_remote_source_t   remote;
+    aes67_sdp_t                 sdp;
+};
+
 struct aes67_webui {
-    aes67_node_handle_t node;
-    httpd_handle_t      httpd;
-    int                 ws_fd;      /* Active WebSocket fd (-1 if none) */
-    TaskHandle_t        ws_task;    /* 2Hz status push task */
-    uint16_t            port;
-    bool                running;
+    aes67_node_handle_t     node;
+    httpd_handle_t          httpd;
+    esp_timer_handle_t      push_timer;   /* periodic status push trigger */
+    struct webui_scratch   *scratch;
+    char                   *json;         /* status frame build buffer */
+    uint16_t                port;
+    bool                    running;
 };
 
 /* ---- Codec name helper ---- */
@@ -596,246 +608,263 @@ static esp_err_t handler_delete_sink(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* ---- WebSocket handler ---- */
+/* ---- WebSocket ---- */
 
+/*
+ * Frames from the browser. The page never sends anything today; the server
+ * handles ping/close itself. Reading the frame keeps the session healthy.
+ */
 static esp_err_t handler_ws(httpd_req_t *req)
 {
-    struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
-
     if (req->method == HTTP_GET) {
-        /* WebSocket upgrade -- store the fd */
-        ctx->ws_fd = httpd_req_to_sockfd(req);
-        ESP_LOGI(TAG, "WebSocket connected (fd=%d)", ctx->ws_fd);
+        /* Not reached on ESP-IDF 5.x: the server answers the handshake and
+         * does not call the handler for it. Clients are found when pushing. */
         return ESP_OK;
     }
 
-    /* Handle incoming WS frames (e.g. pings, close) */
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(ws_pkt));
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-
-    /* Read the frame to acknowledge it */
     uint8_t frame_buf[128];
     ws_pkt.payload = frame_buf;
     esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(frame_buf));
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "WS recv failed: %s", esp_err_to_name(ret));
-        ctx->ws_fd = -1;
+        ESP_LOGD(TAG, "WS recv failed: %s", esp_err_to_name(ret));
     }
-
     return ESP_OK;
 }
 
-/* ---- WebSocket 2Hz push task ---- */
+/* Called by the server for every closed session, WebSocket or not. */
+static void webui_close_fn(httpd_handle_t hd, int fd)
+{
+    (void)hd;
+    ESP_LOGD(TAG, "session fd=%d closed", fd);
+    close(fd);
+}
+
+/* ---- Status push ---- */
 
 /*
- * Build a compact JSON status payload and push it to the connected
- * WebSocket client. Runs every 500ms on core 1, priority 3.
+ * Build the status frame. Runs in the server task (see ws_push_work), so
+ * the heavy copy-outs use ctx->scratch instead of the stack.
  */
-static void ws_push_task(void *arg)
+static int build_status_frame(struct aes67_webui *ctx, char *buf, size_t cap)
+{
+    struct webui_scratch *sc = ctx->scratch;
+
+    int64_t uptime_us = esp_timer_get_time();
+    uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
+    uint32_t heap_free = esp_get_free_heap_size();
+
+    aes67_ptp_handle_t ptp = NULL;
+    aes67_node_get_ptp(ctx->node, &ptp);
+    aes67_ptp_status_t ptp_st = {0};
+    if (ptp) {
+        aes67_ptp_get_status(ptp, &ptp_st);
+    }
+
+    char gm_str[24];
+    snprintf(gm_str, sizeof(gm_str),
+             "%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X",
+             ptp_st.grandmaster_id[0], ptp_st.grandmaster_id[1],
+             ptp_st.grandmaster_id[2], ptp_st.grandmaster_id[3],
+             ptp_st.grandmaster_id[4], ptp_st.grandmaster_id[5],
+             ptp_st.grandmaster_id[6], ptp_st.grandmaster_id[7]);
+
+    /* We are GM if locked with zero offset and zero path delay
+     * (a slave always has non-zero offset/delay from the master) */
+    bool is_gm = (ptp_st.lock_state == AES67_PTP_LOCKED &&
+                  ptp_st.offset_ns == 0 && ptp_st.path_delay_ns == 0);
+
+    int pos = snprintf(buf, cap,
+        "{"
+        "\"t\":\"status\","
+        "\"uptime\":%lu,"
+        "\"heap_free\":%lu,"
+        "\"ptp\":{\"lock\":\"%s\",\"gm\":\"%s\",\"is_gm\":%s,\"offset\":%ld,\"jitter\":%ld,\"delay\":%ld},",
+        (unsigned long)uptime_s,
+        (unsigned long)heap_free,
+        ptp_lock_str(ptp_st.lock_state),
+        gm_str,
+        is_gm ? "true" : "false",
+        (long)ptp_st.offset_ns,
+        (long)ptp_st.jitter_ns,
+        (long)ptp_st.path_delay_ns);
+
+    aes67_session_handle_t sess = NULL;
+    aes67_node_get_session(ctx->node, &sess);
+
+    pos += snprintf(buf + pos, cap - pos, "\"sources\":[");
+    if (sess) {
+        bool first = true;
+        int src_count = aes67_session_get_source_count(sess);
+        for (int i = 0; i < src_count && i < CONFIG_AES67_MAX_SOURCES; i++) {
+            aes67_source_t *src = &sc->src;
+            if (aes67_session_get_source(sess, i, src) != ESP_OK || !src->enabled) {
+                continue;
+            }
+            aes67_rtp_stream_status_t rtp_st = {0};
+            if (src->rtp_stream) {
+                aes67_rtp_stream_get_status(src->rtp_stream, &rtp_st);
+            }
+            if (!first) buf[pos++] = ',';
+            first = false;
+            pos += snprintf(buf + pos, cap - pos,
+                "{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"rate\":%lu,"
+                "\"ch\":%u,\"ptime\":%u,\"tx\":%lu}",
+                src->id, src->name, aes67_codec_to_str(src->rtp_config.codec),
+                (unsigned long)src->rtp_config.sample_rate,
+                src->rtp_config.channels,
+                src->rtp_config.packet_time_us,
+                (unsigned long)rtp_st.packets_sent);
+            if (pos >= (int)cap - 256) break;
+        }
+    }
+    pos += snprintf(buf + pos, cap - pos, "],");
+
+    pos += snprintf(buf + pos, cap - pos, "\"sinks\":[");
+    if (sess) {
+        bool first = true;
+        int sink_count = aes67_session_get_sink_count(sess);
+        for (int i = 0; i < sink_count && i < CONFIG_AES67_MAX_SINKS; i++) {
+            aes67_sink_t *sink = &sc->sink;
+            if (aes67_session_get_sink(sess, i, sink) != ESP_OK || !sink->enabled) {
+                continue;
+            }
+            aes67_rtp_stream_status_t rtp_st = {0};
+            if (sink->rtp_stream) {
+                aes67_rtp_stream_get_status(sink->rtp_stream, &rtp_st);
+            }
+            if (!first) buf[pos++] = ',';
+            first = false;
+            /* Use Ethernet hook counters for sink stats since the hook
+             * intercepts RTP at L2 before the RTP engine sees packets */
+            extern uint32_t s_hook_pkt_count;
+            extern uint32_t s_hook_seq_lost;
+            bool active = s_hook_pkt_count > 0;
+            pos += snprintf(buf + pos, cap - pos,
+                "{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"rate\":%lu,"
+                "\"ch\":%u,\"ptime\":%u,\"rx\":%lu,\"lost\":%lu,"
+                "\"jitter\":%ld,\"active\":%s}",
+                sink->id, sink->name, aes67_codec_to_str(sink->rtp_config.codec),
+                (unsigned long)sink->rtp_config.sample_rate,
+                sink->rtp_config.channels,
+                sink->rtp_config.packet_time_us,
+                (unsigned long)s_hook_pkt_count,
+                (unsigned long)s_hook_seq_lost,
+                (long)rtp_st.jitter_us,
+                active ? "true" : "false");
+            if (pos >= (int)cap - 256) break;
+        }
+    }
+    pos += snprintf(buf + pos, cap - pos, "],");
+
+    aes67_sap_handle_t sap = NULL;
+    aes67_node_get_sap(ctx->node, &sap);
+
+    pos += snprintf(buf + pos, cap - pos, "\"sap_remotes\":[");
+    if (sap) {
+        bool first = true;
+        int rcount = aes67_sap_get_remote_count(sap);
+        for (int i = 0; i < rcount; i++) {
+            aes67_sap_remote_source_t *remote = &sc->remote;
+            if (aes67_sap_get_remote(sap, i, remote) != ESP_OK) {
+                continue;
+            }
+            char origin_str[16];
+            aes67_net_u32_to_ip(remote->origin_ip, origin_str, sizeof(origin_str));
+            if (!first) buf[pos++] = ',';
+            first = false;
+            const char *codec_str = "?";
+            uint32_t rate = 0;
+            uint8_t ch = 0;
+            uint16_t ptime = 0;
+            memset(&sc->sdp, 0, sizeof(sc->sdp));
+            if (aes67_sdp_parse(remote->sdp, &sc->sdp) == ESP_OK) {
+                codec_str = aes67_codec_to_str(sc->sdp.codec);
+                rate = sc->sdp.sample_rate;
+                ch = sc->sdp.channels;
+                ptime = sc->sdp.ptime_us;
+            }
+            pos += snprintf(buf + pos, cap - pos,
+                "{\"name\":\"%s\",\"origin\":\"%s\",\"codec\":\"%s\","
+                "\"rate\":%lu,\"ch\":%u,\"ptime\":%u}",
+                remote->name, origin_str, codec_str,
+                (unsigned long)rate, ch, ptime);
+            if (pos >= (int)cap - 128) break;
+        }
+    }
+    pos += snprintf(buf + pos, cap - pos, "]");
+
+    /* Ethernet hook stats (defined in main.c) */
+    extern uint32_t s_hook_pkt_count;
+    extern uint32_t s_hook_seq_lost;
+    extern uint32_t s_hook_total_frames;
+    pos += snprintf(buf + pos, cap - pos,
+        ",\"eth\":{\"rtp\":%lu,\"total\":%lu,\"lost\":%lu}",
+        (unsigned long)s_hook_pkt_count,
+        (unsigned long)s_hook_total_frames,
+        (unsigned long)s_hook_seq_lost);
+
+    buf[pos++] = '}';
+    buf[pos] = '\0';
+    return pos;
+}
+
+/*
+ * Runs in the server task via httpd_queue_work: find the WebSocket clients,
+ * build one status frame if there is at least one, send it to all of them.
+ * Socket access stays on the server's thread, as the httpd API requires.
+ */
+static void ws_push_work(void *arg)
 {
     struct aes67_webui *ctx = (struct aes67_webui *)arg;
-    char *buf = malloc(JSON_BUF_SIZE);
-
-    if (!buf) {
-        ESP_LOGW(TAG, "WS push task: alloc failed");
-        vTaskDelete(NULL);
+    if (!ctx->running || !ctx->httpd) {
         return;
     }
 
-    while (ctx->running) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-
-        /* Skip if no WebSocket client connected */
-        if (ctx->ws_fd < 0 || !ctx->httpd) {
-            continue;
-        }
-
-        /* Gather status data */
-        int64_t uptime_us = esp_timer_get_time();
-        uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
-        uint32_t heap_free = esp_get_free_heap_size();
-
-        /* PTP status */
-        aes67_ptp_handle_t ptp = NULL;
-        aes67_node_get_ptp(ctx->node, &ptp);
-        aes67_ptp_status_t ptp_st = {0};
-        if (ptp) {
-            aes67_ptp_get_status(ptp, &ptp_st);
-        }
-
-        char gm_str[24];
-        snprintf(gm_str, sizeof(gm_str),
-                 "%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X",
-                 ptp_st.grandmaster_id[0], ptp_st.grandmaster_id[1],
-                 ptp_st.grandmaster_id[2], ptp_st.grandmaster_id[3],
-                 ptp_st.grandmaster_id[4], ptp_st.grandmaster_id[5],
-                 ptp_st.grandmaster_id[6], ptp_st.grandmaster_id[7]);
-
-        /* We are GM if locked with zero offset and zero path delay
-         * (slave always has non-zero offset/delay from the master) */
-        bool is_gm = (ptp_st.lock_state == AES67_PTP_LOCKED &&
-                       ptp_st.offset_ns == 0 && ptp_st.path_delay_ns == 0);
-
-        /* Start building JSON */
-        int pos = snprintf(buf, JSON_BUF_SIZE,
-            "{"
-            "\"t\":\"status\","
-            "\"uptime\":%lu,"
-            "\"heap_free\":%lu,"
-            "\"ptp\":{\"lock\":\"%s\",\"gm\":\"%s\",\"is_gm\":%s,\"offset\":%ld,\"jitter\":%ld,\"delay\":%ld},",
-            (unsigned long)uptime_s,
-            (unsigned long)heap_free,
-            ptp_lock_str(ptp_st.lock_state),
-            gm_str,
-            is_gm ? "true" : "false",
-            (long)ptp_st.offset_ns,
-            (long)ptp_st.jitter_ns,
-            (long)ptp_st.path_delay_ns);
-
-        /* Source stats */
-        aes67_session_handle_t sess = NULL;
-        aes67_node_get_session(ctx->node, &sess);
-
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos, "\"sources\":[");
-        if (sess) {
-            bool first = true;
-            int src_count = aes67_session_get_source_count(sess);
-            for (int i = 0; i < src_count && i < CONFIG_AES67_MAX_SOURCES; i++) {
-                aes67_source_t src;
-                if (aes67_session_get_source(sess, i, &src) != ESP_OK || !src.enabled) {
-                    continue;
-                }
-                aes67_rtp_stream_status_t rtp_st = {0};
-                if (src.rtp_stream) {
-                    aes67_rtp_stream_get_status(src.rtp_stream, &rtp_st);
-                }
-                if (!first) buf[pos++] = ',';
-                first = false;
-                const char *codec = aes67_codec_to_str(src.rtp_config.codec);
-                pos += snprintf(buf + pos, JSON_BUF_SIZE - pos,
-                    "{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"rate\":%lu,"
-                    "\"ch\":%u,\"ptime\":%u,\"tx\":%lu}",
-                    src.id, src.name, codec,
-                    (unsigned long)src.rtp_config.sample_rate,
-                    src.rtp_config.channels,
-                    src.rtp_config.packet_time_us,
-                    (unsigned long)rtp_st.packets_sent);
-                if (pos >= JSON_BUF_SIZE - 256) break;
-            }
-        }
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos, "],");
-
-        /* Sink stats */
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos, "\"sinks\":[");
-        if (sess) {
-            bool first = true;
-            int sink_count = aes67_session_get_sink_count(sess);
-            for (int i = 0; i < sink_count && i < CONFIG_AES67_MAX_SINKS; i++) {
-                aes67_sink_t sink;
-                if (aes67_session_get_sink(sess, i, &sink) != ESP_OK || !sink.enabled) {
-                    continue;
-                }
-                aes67_rtp_stream_status_t rtp_st = {0};
-                if (sink.rtp_stream) {
-                    aes67_rtp_stream_get_status(sink.rtp_stream, &rtp_st);
-                }
-                if (!first) buf[pos++] = ',';
-                first = false;
-                /* Use Ethernet hook counters for sink stats since the hook
-                 * intercepts RTP at L2 before the RTP engine sees packets */
-                extern uint32_t s_hook_pkt_count;
-                extern uint32_t s_hook_seq_lost;
-                const char *scodec = aes67_codec_to_str(sink.rtp_config.codec);
-                bool active = s_hook_pkt_count > 0;
-                pos += snprintf(buf + pos, JSON_BUF_SIZE - pos,
-                    "{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"rate\":%lu,"
-                    "\"ch\":%u,\"ptime\":%u,\"rx\":%lu,\"lost\":%lu,"
-                    "\"jitter\":%ld,\"active\":%s}",
-                    sink.id, sink.name, scodec,
-                    (unsigned long)sink.rtp_config.sample_rate,
-                    sink.rtp_config.channels,
-                    sink.rtp_config.packet_time_us,
-                    (unsigned long)s_hook_pkt_count,
-                    (unsigned long)s_hook_seq_lost,
-                    (long)rtp_st.jitter_us,
-                    active ? "true" : "false");
-                if (pos >= JSON_BUF_SIZE - 256) break;
-            }
-        }
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos, "],");
-
-        /* SAP remotes */
-        aes67_sap_handle_t sap = NULL;
-        aes67_node_get_sap(ctx->node, &sap);
-
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos, "\"sap_remotes\":[");
-        if (sap) {
-            bool first = true;
-            int rcount = aes67_sap_get_remote_count(sap);
-            for (int i = 0; i < rcount; i++) {
-                aes67_sap_remote_source_t remote;
-                if (aes67_sap_get_remote(sap, i, &remote) != ESP_OK) {
-                    continue;
-                }
-                char origin_str[16];
-                aes67_net_u32_to_ip(remote.origin_ip, origin_str, sizeof(origin_str));
-                if (!first) buf[pos++] = ',';
-                first = false;
-                /* Parse SDP to extract stream details */
-                aes67_sdp_t sdp = {0};
-                const char *codec_str = "?";
-                uint32_t rate = 0;
-                uint8_t ch = 0;
-                uint16_t ptime = 0;
-                if (aes67_sdp_parse(remote.sdp, &sdp) == ESP_OK) {
-                    codec_str = aes67_codec_to_str(sdp.codec);
-                    rate = sdp.sample_rate;
-                    ch = sdp.channels;
-                    ptime = sdp.ptime_us;
-                }
-                pos += snprintf(buf + pos, JSON_BUF_SIZE - pos,
-                    "{\"name\":\"%s\",\"origin\":\"%s\",\"codec\":\"%s\","
-                    "\"rate\":%lu,\"ch\":%u,\"ptime\":%u}",
-                    remote.name, origin_str, codec_str,
-                    (unsigned long)rate, ch, ptime);
-                if (pos >= JSON_BUF_SIZE - 128) break;
-            }
-        }
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos, "]");
-
-        /* Ethernet hook stats (defined in main.c) */
-        extern uint32_t s_hook_pkt_count;
-        extern uint32_t s_hook_seq_lost;
-        extern uint32_t s_hook_total_frames;
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos,
-            ",\"eth\":{\"rtp\":%lu,\"total\":%lu,\"lost\":%lu}",
-            (unsigned long)s_hook_pkt_count,
-            (unsigned long)s_hook_total_frames,
-            (unsigned long)s_hook_seq_lost);
-
-        /* Close the JSON object */
-        buf[pos++] = '}';
-        buf[pos] = '\0';
-
-        /* Send via async WS frame (must be queued through httpd work queue) */
-        httpd_ws_frame_t ws_pkt;
-        memset(&ws_pkt, 0, sizeof(ws_pkt));
-        ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-        ws_pkt.payload = (uint8_t *)buf;
-        ws_pkt.len = pos;
-
-        esp_err_t ret = httpd_ws_send_frame_async(ctx->httpd, ctx->ws_fd, &ws_pkt);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "WS send failed (fd=%d): %s", ctx->ws_fd,
-                     esp_err_to_name(ret));
-            ctx->ws_fd = -1;
-        }
+    int fds[CONFIG_LWIP_MAX_SOCKETS];
+    size_t nfds = CONFIG_LWIP_MAX_SOCKETS;
+    if (httpd_get_client_list(ctx->httpd, &nfds, fds) != ESP_OK) {
+        return;
     }
 
-    free(buf);
-    ESP_LOGI(TAG, "WS push task stopped");
-    vTaskDelete(NULL);
+    int clients = 0;
+    for (size_t i = 0; i < nfds; i++) {
+        if (httpd_ws_get_fd_info(ctx->httpd, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
+            fds[clients++] = fds[i];
+        }
+    }
+    if (clients == 0) {
+        return;
+    }
+
+    int len = build_status_frame(ctx, ctx->json, JSON_BUF_SIZE);
+    if (len <= 0) {
+        return;
+    }
+
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(ws_pkt));
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+    ws_pkt.payload = (uint8_t *)ctx->json;
+    ws_pkt.len = len;
+
+    for (int i = 0; i < clients; i++) {
+        esp_err_t ret = httpd_ws_send_frame_async(ctx->httpd, fds[i], &ws_pkt);
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "WS send to fd=%d failed: %s", fds[i], esp_err_to_name(ret));
+        }
+    }
+}
+
+/* esp_timer callback: hand the push to the server task. */
+static void push_timer_cb(void *arg)
+{
+    struct aes67_webui *ctx = (struct aes67_webui *)arg;
+    if (ctx->running && ctx->httpd) {
+        httpd_queue_work(ctx->httpd, ws_push_work, ctx);
+    }
 }
 
 /* ---- Public API ---- */
@@ -855,10 +884,16 @@ esp_err_t aes67_webui_init(aes67_node_handle_t node, uint16_t port,
 
     ctx->node = node;
     ctx->port = port;
-    ctx->ws_fd = -1;
-    ctx->ws_task = NULL;
     ctx->httpd = NULL;
     ctx->running = false;
+    ctx->scratch = calloc(1, sizeof(struct webui_scratch));
+    ctx->json = malloc(JSON_BUF_SIZE);
+    if (!ctx->scratch || !ctx->json) {
+        free(ctx->scratch);
+        free(ctx->json);
+        free(ctx);
+        return ESP_ERR_NO_MEM;
+    }
 
     *handle = ctx;
     return ESP_OK;
@@ -883,6 +918,7 @@ esp_err_t aes67_webui_start(aes67_webui_handle_t handle)
     config.max_open_sockets = 7;
     config.keep_alive_enable = false;  /* Close HTTP conns immediately, free sockets for WS */
     config.core_id = 1;  /* Run HTTP server on core 1 (audio on core 0) */
+    config.close_fn = webui_close_fn;
 
     esp_err_t ret = httpd_start(&handle->httpd, &config);
     if (ret != ESP_OK) {
@@ -983,14 +1019,20 @@ esp_err_t aes67_webui_start(aes67_webui_handle_t handle)
     };
     httpd_register_uri_handler(handle->httpd, &uri_sinks_delete);
 
-    /* Start the 2Hz WebSocket push task on core 1 */
+    /* Periodic status push: the timer only queues work onto the server
+     * task, which builds and sends the frame (see ws_push_work). */
     handle->running = true;
-    BaseType_t xret = xTaskCreatePinnedToCore(
-        ws_push_task, "aes67_ws", 4096, handle,
-        3, &handle->ws_task, 1);
-    if (xret != pdPASS) {
-        ESP_LOGW(TAG, "Failed to create WS push task");
-        handle->ws_task = NULL;
+    const esp_timer_create_args_t targs = {
+        .callback = push_timer_cb,
+        .arg = handle,
+        .name = "aes67_ws",
+    };
+    if (esp_timer_create(&targs, &handle->push_timer) == ESP_OK) {
+        esp_timer_start_periodic(handle->push_timer,
+                                 (uint64_t)CONFIG_AES67_WEBUI_PUSH_INTERVAL_MS * 1000);
+    } else {
+        ESP_LOGW(TAG, "Failed to create status push timer");
+        handle->push_timer = NULL;
     }
 
     ESP_LOGI(TAG, "Web UI started on port %u", handle->port);
@@ -1006,22 +1048,20 @@ esp_err_t aes67_webui_stop(aes67_webui_handle_t handle)
         return ESP_OK;
     }
 
-    /* Signal the push task to exit */
     handle->running = false;
 
-    /* Give it time to exit cleanly */
-    if (handle->ws_task) {
-        vTaskDelay(pdMS_TO_TICKS(600));
-        handle->ws_task = NULL;
+    if (handle->push_timer) {
+        esp_timer_stop(handle->push_timer);
+        esp_timer_delete(handle->push_timer);
+        handle->push_timer = NULL;
     }
 
-    /* Stop the HTTP server */
+    /* httpd_stop drains queued work before returning, so no push can run
+     * on a stopped server. */
     if (handle->httpd) {
         httpd_stop(handle->httpd);
         handle->httpd = NULL;
     }
-
-    handle->ws_fd = -1;
 
     ESP_LOGI(TAG, "Web UI stopped");
     return ESP_OK;
