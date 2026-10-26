@@ -48,9 +48,13 @@ typedef void (*aes67_ptp_lock_cb_t)(aes67_ptp_lock_state_t state, void *user_dat
 
 /**
  * Initialize the PTP subsystem. Uses ESP-IDF ptpd and hardware timestamping.
+ *
+ * @param netif_key  esp_netif interface key of the Ethernet interface, as
+ *                   created by the application ("ETH_DEF" for
+ *                   ESP_NETIF_DEFAULT_ETH()).
  */
 esp_err_t aes67_ptp_init(esp_eth_handle_t eth_handle, const aes67_ptp_config_t *config,
-                         aes67_ptp_handle_t *handle);
+                         const char *netif_key, aes67_ptp_handle_t *handle);
 
 /**
  * Start PTP synchronization.

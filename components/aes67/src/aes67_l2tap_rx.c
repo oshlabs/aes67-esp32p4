@@ -13,6 +13,7 @@
  */
 
 #include "aes67_l2tap_rx.h"
+#include "aes67_net.h"
 #include "aes67_convert.h"
 
 #include <string.h>
@@ -213,7 +214,7 @@ static int l2tap_open(void)
     }
 
     /* Bind to the ETH_0 interface */
-    const char *ifname = "ETH_0";
+    const char *ifname = aes67_net_get_interface();
     if (ioctl(fd, L2TAP_S_INTF_DEVICE, ifname) < 0) {
         ESP_LOGE(TAG, "L2TAP_S_INTF_DEVICE failed: errno=%d", errno);
         close(fd);

@@ -163,6 +163,9 @@ All parameters are configurable via `idf.py menuconfig` under "AES67 RAVENNA Com
 - Default channel count (default: 2)
 - RTP port (default: 5004)
 - PTP domain (default: 0)
+- `config.net.interface_name`: the esp_netif key of your Ethernet interface,
+  default `"ETH_DEF"` (what `ESP_NETIF_DEFAULT_ETH()` creates). Node init fails
+  with a clear error if no netif has that key.
 - Jitter buffer depth (default: 4ms)
 - PSRAM usage for buffers
 - I2S pin assignments

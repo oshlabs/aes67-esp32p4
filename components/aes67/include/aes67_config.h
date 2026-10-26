@@ -136,7 +136,7 @@ static inline aes67_codec_t aes67_word_length_codec(uint8_t wl)
 
 /* Network configuration */
 typedef struct {
-    char interface_name[16];            /* Ethernet interface, e.g. "ETH_0" */
+    char interface_name[16];            /* esp_netif key of the Ethernet interface ("ETH_DEF" for ESP_NETIF_DEFAULT_ETH) */
     esp_eth_handle_t eth_handle;        /* Ethernet driver handle */
     char rtp_mcast_base[16];            /* Base multicast address for RTP */
     uint16_t rtp_port;                  /* RTP port (default 5004) */
@@ -192,7 +192,7 @@ typedef struct {
 #define AES67_CONFIG_DEFAULT() { \
     .node_name = CONFIG_AES67_NODE_NAME, \
     .net = { \
-        .interface_name = "ETH_0", \
+        .interface_name = "ETH_DEF", \
         .eth_handle = NULL, \
         .rtp_mcast_base = CONFIG_AES67_RTP_MCAST_BASE, \
         .rtp_port = CONFIG_AES67_RTP_PORT, \

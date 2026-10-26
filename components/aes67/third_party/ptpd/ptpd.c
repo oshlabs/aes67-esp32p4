@@ -290,6 +290,9 @@ static const char *TAG = "ptpd";
 #ifdef ESP_PTP
 static struct ptp_state_s *s_state;
 static SemaphoreHandle_t s_daemon_done = NULL;  /* given when the daemon task exits */
+static SemaphoreHandle_t s_init_done = NULL;    /* given once ptp_initialize_state has run */
+static volatile int s_init_result = 0;          /* 0 on success, -errno on failure */
+static portMUX_TYPE s_statusreq_lock = portMUX_INITIALIZER_UNLOCKED;
 #endif
 
 /****************************************************************************
@@ -2020,10 +2023,24 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state)
 {
   FAR struct ptpd_status_s *status;
 
+#ifdef ESP_PTP
+  portENTER_CRITICAL(&s_statusreq_lock);
+  struct ptpd_statusreq_s req = state->status_req;
+  state->status_req.dest = NULL;
+  state->status_req.done = NULL;
+  portEXIT_CRITICAL(&s_statusreq_lock);
+  if (!req.dest)
+    {
+      return; /* No active request */
+    }
+  /* Work on the local copy; the requester may time out meanwhile. */
+  state->status_req = req;
+#else
   if (!state->status_req.dest)
     {
       return; /* No active request */
     }
+#endif
 
   status = state->status_req.dest;
   status->clock_source_valid = state->selected_source_valid;
@@ -2130,11 +2147,17 @@ static int ptp_daemon(int argc, FAR char** argv)
       free(state);
 
 #ifdef ESP_PTP
+      s_init_result = -EIO;
+      if (s_init_done) xSemaphoreGive(s_init_done);
       goto err;
 #else
       return ERROR;
 #endif // ESP_PTP
     }
+#ifdef ESP_PTP
+  s_init_result = 0;
+  if (s_init_done) xSemaphoreGive(s_init_done);
+#endif
 #ifndef ESP_PTP
   ptp_setup_sighandlers(state);
 #endif // !ESP_PTP
@@ -2300,17 +2323,32 @@ err:
 int ptpd_start(FAR const char *interface)
 {
 #ifdef ESP_PTP
-  if (s_state == NULL) {
-    if (s_daemon_done == NULL)
-      {
-        s_daemon_done = xSemaphoreCreateBinary();
-      }
-    xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
-              (void *)interface, tskIDLE_PRIORITY + 2, NULL);
-    return 1;
-  }
-  ESP_LOGE(TAG, "Other instance of PTP is already running");
-  return -1;
+  if (s_state != NULL)
+    {
+      ESP_LOGE(TAG, "Other instance of PTP is already running");
+      return -EBUSY;
+    }
+  if (s_daemon_done == NULL)
+    {
+      s_daemon_done = xSemaphoreCreateBinary();
+    }
+  if (s_init_done == NULL)
+    {
+      s_init_done = xSemaphoreCreateBinary();
+    }
+  if (xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
+                  (void *)interface, tskIDLE_PRIORITY + 2, NULL) != pdPASS)
+    {
+      return -ENOMEM;
+    }
+  /* Wait for the task to open its sockets and tap, so a failure (unknown
+   * interface key, tap not registered) is reported here instead of
+   * surfacing as a crash in a later status call. */
+  if (xSemaphoreTake(s_init_done, pdMS_TO_TICKS(5000)) != pdTRUE)
+    {
+      return -ETIMEDOUT;
+    }
+  return s_init_result == 0 ? 1 : s_init_result;
 #else
   int pid;
   FAR char *task_argv[] = {
@@ -2366,6 +2404,11 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status)
   struct ptpd_statusreq_s req;
   struct timespec timeout;
 
+  if (s_state == NULL)
+    {
+      return -ESRCH;
+    }
+
   /* Fill in the status request */
 
   memset(status, 0, sizeof(struct ptpd_status_s));
@@ -2373,7 +2416,15 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status)
   req.done = &donesem;
   req.dest = status;
 
+  portENTER_CRITICAL(&s_statusreq_lock);
+  if (s_state == NULL)
+    {
+      portEXIT_CRITICAL(&s_statusreq_lock);
+      sem_destroy(&donesem);
+      return -ESRCH;
+    }
   s_state->status_req = req;
+  portEXIT_CRITICAL(&s_statusreq_lock);
 
   /* Wait for status request to be handled */
   clock_gettime(CLOCK_REALTIME, &timeout); // sem_timedwait uses CLOCK_REALTIME

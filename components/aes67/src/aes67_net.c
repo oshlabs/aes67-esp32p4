@@ -147,9 +147,24 @@ bool aes67_net_is_multicast(uint32_t ip)
     return (host_ip & 0xF0000000) == 0xE0000000;
 }
 
+/* esp_netif key of the interface the node runs on; set by aes67_node_init */
+static char s_netif_key[16] = "ETH_DEF";
+
+void aes67_net_set_interface(const char *netif_key)
+{
+    if (netif_key && netif_key[0]) {
+        strlcpy(s_netif_key, netif_key, sizeof(s_netif_key));
+    }
+}
+
+const char *aes67_net_get_interface(void)
+{
+    return s_netif_key;
+}
+
 esp_err_t aes67_net_get_local_ip(uint32_t *ip)
 {
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("ETH_0");
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey(s_netif_key);
     if (!netif) {
         ESP_LOGE(TAG, "no ethernet netif found");
         return ESP_ERR_NOT_FOUND;
@@ -167,7 +182,7 @@ esp_err_t aes67_net_get_local_ip(uint32_t *ip)
 
 esp_err_t aes67_net_get_local_mac(uint8_t mac[6])
 {
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("ETH_0");
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey(s_netif_key);
     if (!netif) {
         return ESP_ERR_NOT_FOUND;
     }

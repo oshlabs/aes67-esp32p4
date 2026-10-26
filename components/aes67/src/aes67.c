@@ -19,10 +19,12 @@
 #include "aes67_audio.h"
 #include "aes67_session.h"
 #include "aes67_hw_timer.h"
+#include "aes67_net.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -347,10 +349,21 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
     }
     memcpy(&node->config, config, sizeof(aes67_config_t));
 
+    /* Resolve the Ethernet netif once; everything below binds to this key. */
+    aes67_net_set_interface(node->config.net.interface_name);
+    if (!esp_netif_get_handle_from_ifkey(node->config.net.interface_name)) {
+        ESP_LOGE(TAG, "no esp_netif with key \"%s\"; set config.net.interface_name "
+                 "to the key the Ethernet netif was created with",
+                 node->config.net.interface_name);
+        free(node);
+        return ESP_ERR_NOT_FOUND;
+    }
+
     esp_err_t ret;
 
     /* 1. PTP clock subsystem */
-    ret = aes67_ptp_init(node->config.net.eth_handle, &node->config.ptp, &node->ptp);
+    ret = aes67_ptp_init(node->config.net.eth_handle, &node->config.ptp,
+                         node->config.net.interface_name, &node->ptp);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PTP init failed: %s", esp_err_to_name(ret));
         goto fail_ptp;

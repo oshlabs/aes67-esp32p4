@@ -33,7 +33,7 @@ static const char *TAG = "aes67_ptp";
 #define PTP_MONITOR_INTERVAL_MS     500
 #define PTP_MONITOR_STACK_SIZE      4096
 #define PTP_MONITOR_PRIORITY        10  /* Above SAP, below RTP/audio */
-#define PTP_INTERFACE_NAME          "ETH_0"
+#define PTP_STATUS_FAILS_BEFORE_UNLOCK 4   /* consecutive ptpd_status failures */
 
 /* PTP daemon and clock APIs from local components */
 #include "ptpd.h"
@@ -45,6 +45,8 @@ static const char *TAG = "aes67_ptp";
  * ------------------------------------------------------------------- */
 struct aes67_ptp_ctx {
     esp_eth_handle_t eth_handle;
+    char netif_key[16];             /* esp_netif interface key the daemon binds to */
+    int status_failures;            /* consecutive ptpd_status failures */
     int ptpd_pid;
     aes67_ptp_config_t config;
     aes67_ptp_lock_state_t lock_state;
@@ -154,9 +156,20 @@ static void ptp_monitor_task(void *arg)
         }
         int ret = ptpd_status(ctx->ptpd_pid, &status);
         if (ret != 0) {
-            ESP_LOGD(TAG, "ptpd_status returned %d, daemon may still be initializing", ret);
+            /* Daemon gone or wedged: after a few misses report UNLOCKED
+             * once and keep polling quietly. */
+            if (++ctx->status_failures == PTP_STATUS_FAILS_BEFORE_UNLOCK) {
+                ESP_LOGW(TAG, "ptpd_status failing (%d); reporting unlocked", ret);
+                aes67_ptp_lock_state_t prev = ctx->lock_state;
+                ctx->lock_state = AES67_PTP_UNLOCKED;
+                ctx->stable_count = 0;
+                if (prev != AES67_PTP_UNLOCKED && ctx->lock_cb) {
+                    ctx->lock_cb(ctx->lock_state, ctx->lock_cb_user_data);
+                }
+            }
             continue;
         }
+        ctx->status_failures = 0;
 
         /* Cache latest offset and path delay.
          * last_delta_ns is the measured clock error from the most recent sync. */
@@ -262,8 +275,9 @@ static void ptp_monitor_task(void *arg)
  * ------------------------------------------------------------------- */
 
 esp_err_t aes67_ptp_init(esp_eth_handle_t eth_handle, const aes67_ptp_config_t *config,
-                         aes67_ptp_handle_t *handle)
+                         const char *netif_key, aes67_ptp_handle_t *handle)
 {
+    ESP_RETURN_ON_FALSE(netif_key && netif_key[0], ESP_ERR_INVALID_ARG, TAG, "netif key required");
     ESP_RETURN_ON_FALSE(eth_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "eth_handle is NULL");
     ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG, "config is NULL");
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "handle is NULL");
@@ -273,6 +287,7 @@ esp_err_t aes67_ptp_init(esp_eth_handle_t eth_handle, const aes67_ptp_config_t *
 
     ctx->eth_handle = eth_handle;
     ctx->config = *config;
+    strlcpy(ctx->netif_key, netif_key, sizeof(ctx->netif_key));
     ctx->monitor_done = xSemaphoreCreateBinary();
     if (!ctx->monitor_done) {
         free(ctx);
@@ -322,14 +337,14 @@ esp_err_t aes67_ptp_start(aes67_ptp_handle_t handle)
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "handle is NULL");
     ESP_RETURN_ON_FALSE(!handle->running, ESP_ERR_INVALID_STATE, TAG, "PTP already running");
 
-    /* Start the ptpd daemon. The interface name passed here must match
-     * what the ESP netif was created with. For default ethernet config
-     * this is typically "ETH_DEF". */
-    int pid = ptpd_start(PTP_INTERFACE_NAME);
+    /* Start the ptpd daemon on the configured netif key; the call returns
+     * only after the daemon has opened its tap and sockets, or failed. */
+    int pid = ptpd_start(handle->netif_key);
     if (pid < 0) {
-        ESP_LOGE(TAG, "ptpd_start failed (returned %d)", pid);
+        ESP_LOGE(TAG, "ptpd_start on \"%s\" failed (%d)", handle->netif_key, pid);
         return ESP_FAIL;
     }
+    handle->status_failures = 0;
 
     handle->ptpd_pid = pid;
     handle->running = true;

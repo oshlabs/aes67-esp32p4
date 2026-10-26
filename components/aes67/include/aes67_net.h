@@ -78,6 +78,13 @@ bool aes67_net_is_multicast(uint32_t ip);
 /**
  * Get the local interface IP address for the default Ethernet interface.
  */
+/**
+ * Set / get the esp_netif interface key the node runs on (default "ETH_DEF").
+ * aes67_node_init() sets it from aes67_net_config_t.interface_name.
+ */
+void aes67_net_set_interface(const char *netif_key);
+const char *aes67_net_get_interface(void);
+
 esp_err_t aes67_net_get_local_ip(uint32_t *ip);
 
 /**
