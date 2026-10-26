@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
@@ -42,8 +43,11 @@ static const char *TAG = "aes67_webui";
 extern const uint8_t index_html_gz_start[] asm("_binary_index_html_gz_start");
 extern const uint8_t index_html_gz_end[]   asm("_binary_index_html_gz_end");
 
-/* JSON response buffer size for REST endpoints and WS pushes */
-#define JSON_BUF_SIZE 2048
+/* One buffer serves every REST response and the WebSocket status frame.
+ * Sized for the maxima: 16 SAP remotes and 8 streams at about 200 bytes
+ * each plus headers is under 5 KB; names are escaped later, which can
+ * grow an entry, hence the margin. Overflow is handled, not assumed away. */
+#define JSON_BUF_SIZE 8192
 
 /* ---- Context ---- */
 
@@ -112,29 +116,88 @@ static esp_err_t handler_favicon(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
-/* ---- GET /api/info ---- */
+/* ---- Bounded JSON builder ----
+ *
+ * Every JSON document is appended into a jbuf. A write that does not fit
+ * sets the overflow flag and leaves the buffer unchanged, so the length
+ * never runs past the capacity (plain "pos += snprintf" would). Array
+ * entries are written between jb_mark() and jb_rollback(): on overflow
+ * the partial entry is removed and the array stays well formed. */
 
-static esp_err_t handler_api_info(httpd_req_t *req)
+typedef struct {
+    char   *buf;
+    size_t  cap;
+    size_t  len;
+    bool    overflow;
+} jbuf_t;
+
+static void jb_init(jbuf_t *jb, char *buf, size_t cap)
 {
-    struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
-    char *buf = malloc(JSON_BUF_SIZE);
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    jb->buf = buf;
+    jb->cap = cap;
+    jb->len = 0;
+    jb->overflow = false;
+    if (cap) buf[0] = '\0';
+}
 
+static bool jb_printf(jbuf_t *jb, const char *fmt, ...)
+{
+    if (jb->overflow) return false;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(jb->buf + jb->len, jb->cap - jb->len, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= jb->cap - jb->len) {
+        jb->buf[jb->len] = '\0';
+        jb->overflow = true;
+        return false;
+    }
+    jb->len += (size_t)n;
+    return true;
+}
+
+static size_t jb_mark(const jbuf_t *jb)
+{
+    return jb->len;
+}
+
+/* Undo everything written since mark and clear the overflow flag so the
+ * caller can still close the document. */
+static void jb_rollback(jbuf_t *jb, size_t mark)
+{
+    jb->len = mark;
+    jb->buf[mark] = '\0';
+    jb->overflow = false;
+}
+
+/* ---- JSON fragments shared by REST and the WebSocket frame ---- */
+
+static void json_ptp_object(jbuf_t *jb, const aes67_ptp_status_t *st)
+{
+    /* We are GM if locked with zero offset and zero path delay
+     * (a slave always has non-zero offset/delay from the master) */
+    bool is_gm = (st->lock_state == AES67_PTP_LOCKED &&
+                  st->offset_ns == 0 && st->path_delay_ns == 0);
+    jb_printf(jb,
+        "{\"lock_state\":\"%s\","
+        "\"grandmaster\":\"%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X\","
+        "\"is_gm\":%s,\"domain\":%u,"
+        "\"offset_ns\":%ld,\"jitter_ns\":%ld,\"path_delay_ns\":%ld}",
+        ptp_lock_str(st->lock_state),
+        st->grandmaster_id[0], st->grandmaster_id[1],
+        st->grandmaster_id[2], st->grandmaster_id[3],
+        st->grandmaster_id[4], st->grandmaster_id[5],
+        st->grandmaster_id[6], st->grandmaster_id[7],
+        is_gm ? "true" : "false",
+        st->domain,
+        (long)st->offset_ns, (long)st->jitter_ns, (long)st->path_delay_ns);
+}
+
+static void json_info_object(jbuf_t *jb, struct aes67_webui *ctx)
+{
     aes67_config_t cfg;
     aes67_node_get_config(ctx->node, &cfg);
 
-    /* Uptime in seconds */
-    int64_t uptime_us = esp_timer_get_time();
-    uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
-
-    /* Heap stats */
-    uint32_t heap_free = esp_get_free_heap_size();
-    uint32_t heap_min = esp_get_minimum_free_heap_size();
-
-    /* Network info */
     uint32_t ip_u32 = 0;
     uint8_t mac[6] = {0};
     aes67_net_get_local_ip(&ip_u32);
@@ -142,36 +205,177 @@ static esp_err_t handler_api_info(httpd_req_t *req)
     char ip_str[16];
     aes67_net_u32_to_ip(ip_u32, ip_str, sizeof(ip_str));
 
-    int len = snprintf(buf, JSON_BUF_SIZE,
-        "{"
-        "\"name\":\"%s\","
-        "\"version\":\"%d.%d.%d\","
-        "\"ip\":\"%s\","
+    jb_printf(jb,
+        "{\"name\":\"%s\",\"version\":\"%d.%d.%d\",\"ip\":\"%s\","
         "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\","
-        "\"uptime\":%lu,"
-        "\"heap_free\":%lu,"
-        "\"heap_min\":%lu,"
-        "\"sample_rate\":%lu,"
-        "\"channels\":%u,"
-        "\"codec\":\"%s\","
-        "\"ptime_us\":%u"
-        "}",
+        "\"uptime\":%lu,\"heap_free\":%lu,\"heap_min\":%lu,"
+        "\"sample_rate\":%lu,\"channels\":%u,\"codec\":\"%s\",\"ptime_us\":%u}",
         cfg.node_name,
         AES67_VERSION_MAJOR, AES67_VERSION_MINOR, AES67_VERSION_PATCH,
         ip_str,
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        (unsigned long)uptime_s,
-        (unsigned long)heap_free,
-        (unsigned long)heap_min,
+        (unsigned long)(esp_timer_get_time() / 1000000),
+        (unsigned long)esp_get_free_heap_size(),
+        (unsigned long)esp_get_minimum_free_heap_size(),
         (unsigned long)cfg.audio.sample_rate,
         cfg.audio.channels,
         codec_name(cfg.audio.codec),
         cfg.audio.packet_time_us);
+}
 
+/* Append "[entry,entry,...]" of the enabled sources. Returns false if the
+ * array had to be cut short. */
+static bool json_sources_array(jbuf_t *jb, struct aes67_webui *ctx)
+{
+    aes67_session_handle_t sess = NULL;
+    aes67_node_get_session(ctx->node, &sess);
+    aes67_source_t *src = &ctx->scratch->src;
+    bool complete = true, first = true;
+
+    jb_printf(jb, "[");
+    int count = sess ? aes67_session_get_source_count(sess) : 0;
+    for (int i = 0; i < count && i < CONFIG_AES67_MAX_SOURCES; i++) {
+        if (aes67_session_get_source(sess, i, src) != ESP_OK || !src->enabled) {
+            continue;
+        }
+        aes67_rtp_stream_status_t rtp_st = {0};
+        if (src->rtp_stream) {
+            aes67_rtp_stream_get_status(src->rtp_stream, &rtp_st);
+        }
+        size_t mark = jb_mark(jb);
+        bool ok = jb_printf(jb,
+            "%s{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"sample_rate\":%lu,"
+            "\"channels\":%u,\"ptime_us\":%u,\"packets_sent\":%lu}",
+            first ? "" : ",",
+            src->id, src->name, codec_name(src->rtp_config.codec),
+            (unsigned long)src->rtp_config.sample_rate,
+            src->rtp_config.channels,
+            src->rtp_config.packet_time_us,
+            (unsigned long)rtp_st.packets_sent);
+        if (!ok) {
+            jb_rollback(jb, mark);
+            complete = false;
+            break;
+        }
+        first = false;
+    }
+    jb_printf(jb, "]");
+    return complete;
+}
+
+static bool json_sinks_array(jbuf_t *jb, struct aes67_webui *ctx)
+{
+    aes67_session_handle_t sess = NULL;
+    aes67_node_get_session(ctx->node, &sess);
+    aes67_sink_t *sink = &ctx->scratch->sink;
+    bool complete = true, first = true;
+
+    jb_printf(jb, "[");
+    int count = sess ? aes67_session_get_sink_count(sess) : 0;
+    for (int i = 0; i < count && i < CONFIG_AES67_MAX_SINKS; i++) {
+        if (aes67_session_get_sink(sess, i, sink) != ESP_OK || !sink->enabled) {
+            continue;
+        }
+        aes67_rtp_stream_status_t rtp_st = {0};
+        if (sink->rtp_stream) {
+            aes67_rtp_stream_get_status(sink->rtp_stream, &rtp_st);
+        }
+        /* The Ethernet hook intercepts RTP at L2 before the engine sees
+         * packets, so its counters are the ones that move (defined in the
+         * example's main.c for now). */
+        extern uint32_t s_hook_pkt_count;
+        extern uint32_t s_hook_seq_lost;
+        size_t mark = jb_mark(jb);
+        bool ok = jb_printf(jb,
+            "%s{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"sample_rate\":%lu,"
+            "\"channels\":%u,\"ptime_us\":%u,\"packets_received\":%lu,"
+            "\"packets_lost\":%lu,\"jitter_us\":%ld,\"receiving\":%s}",
+            first ? "" : ",",
+            sink->id, sink->name, codec_name(sink->rtp_config.codec),
+            (unsigned long)sink->rtp_config.sample_rate,
+            sink->rtp_config.channels,
+            sink->rtp_config.packet_time_us,
+            (unsigned long)s_hook_pkt_count,
+            (unsigned long)s_hook_seq_lost,
+            (long)rtp_st.jitter_us,
+            s_hook_pkt_count > 0 ? "true" : "false");
+        if (!ok) {
+            jb_rollback(jb, mark);
+            complete = false;
+            break;
+        }
+        first = false;
+    }
+    jb_printf(jb, "]");
+    return complete;
+}
+
+static bool json_remotes_array(jbuf_t *jb, struct aes67_webui *ctx)
+{
+    aes67_sap_handle_t sap = NULL;
+    aes67_node_get_sap(ctx->node, &sap);
+    aes67_sap_remote_source_t *remote = &ctx->scratch->remote;
+    aes67_sdp_t *sdp = &ctx->scratch->sdp;
+    bool complete = true, first = true;
+
+    jb_printf(jb, "[");
+    int count = sap ? aes67_sap_get_remote_count(sap) : 0;
+    for (int i = 0; i < count; i++) {
+        if (aes67_sap_get_remote(sap, i, remote) != ESP_OK) {
+            continue;
+        }
+        char origin_str[16];
+        aes67_net_u32_to_ip(remote->origin_ip, origin_str, sizeof(origin_str));
+        const char *codec_str = "?";
+        uint32_t rate = 0;
+        uint8_t ch = 0;
+        uint16_t ptime = 0;
+        memset(sdp, 0, sizeof(*sdp));
+        if (aes67_sdp_parse(remote->sdp, sdp) == ESP_OK) {
+            codec_str = codec_name(sdp->codec);
+            rate = sdp->sample_rate;
+            ch = sdp->channels;
+            ptime = sdp->ptime_us;
+        }
+        size_t mark = jb_mark(jb);
+        bool ok = jb_printf(jb,
+            "%s{\"name\":\"%s\",\"origin\":\"%s\",\"msg_id\":%u,"
+            "\"codec\":\"%s\",\"sample_rate\":%lu,\"channels\":%u,\"ptime_us\":%u}",
+            first ? "" : ",",
+            remote->name, origin_str, remote->msg_id,
+            codec_str, (unsigned long)rate, ch, ptime);
+        if (!ok) {
+            jb_rollback(jb, mark);
+            complete = false;
+            break;
+        }
+        first = false;
+    }
+    jb_printf(jb, "]");
+    return complete;
+}
+
+/* Send a jbuf as the JSON response; 500 if it overflowed. */
+static esp_err_t send_json(httpd_req_t *req, const jbuf_t *jb)
+{
+    if (jb->overflow) {
+        ESP_LOGW(TAG, "JSON response for %s exceeds %u bytes", req->uri, (unsigned)jb->cap);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, buf, len);
-    free(buf);
-    return ESP_OK;
+    return httpd_resp_send(req, jb->buf, jb->len);
+}
+
+/* ---- GET /api/info ---- */
+
+static esp_err_t handler_api_info(httpd_req_t *req)
+{
+    struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
+    jbuf_t jb;
+    jb_init(&jb, ctx->json, JSON_BUF_SIZE);
+    json_info_object(&jb, ctx);
+    return send_json(req, &jb);
 }
 
 /* ---- GET /api/ptp ---- */
@@ -179,250 +383,45 @@ static esp_err_t handler_api_info(httpd_req_t *req)
 static esp_err_t handler_api_ptp(httpd_req_t *req)
 {
     struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
-    char *buf = malloc(JSON_BUF_SIZE);
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
     aes67_ptp_handle_t ptp = NULL;
     aes67_node_get_ptp(ctx->node, &ptp);
-
     aes67_ptp_status_t st = {0};
     if (ptp) {
         aes67_ptp_get_status(ptp, &st);
     }
-
-    /* Format grandmaster ID as dash-separated hex */
-    char gm_str[24];
-    snprintf(gm_str, sizeof(gm_str),
-             "%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X",
-             st.grandmaster_id[0], st.grandmaster_id[1],
-             st.grandmaster_id[2], st.grandmaster_id[3],
-             st.grandmaster_id[4], st.grandmaster_id[5],
-             st.grandmaster_id[6], st.grandmaster_id[7]);
-
-    int len = snprintf(buf, JSON_BUF_SIZE,
-        "{"
-        "\"lock_state\":\"%s\","
-        "\"grandmaster\":\"%s\","
-        "\"domain\":%u,"
-        "\"offset_ns\":%ld,"
-        "\"jitter_ns\":%ld,"
-        "\"path_delay_ns\":%ld"
-        "}",
-        ptp_lock_str(st.lock_state),
-        gm_str,
-        st.domain,
-        (long)st.offset_ns,
-        (long)st.jitter_ns,
-        (long)st.path_delay_ns);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, buf, len);
-    free(buf);
-    return ESP_OK;
+    jbuf_t jb;
+    jb_init(&jb, ctx->json, JSON_BUF_SIZE);
+    json_ptp_object(&jb, &st);
+    return send_json(req, &jb);
 }
 
-/* ---- GET /api/sources ---- */
+/* ---- GET /api/sources, /api/sinks, /api/sap/remotes ---- */
 
 static esp_err_t handler_api_sources(httpd_req_t *req)
 {
     struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
-    char *buf = malloc(JSON_BUF_SIZE);
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    aes67_session_handle_t sess = NULL;
-    aes67_node_get_session(ctx->node, &sess);
-
-    int pos = 0;
-    buf[pos++] = '[';
-
-    int count = sess ? aes67_session_get_source_count(sess) : 0;
-    bool first = true;
-
-    for (int i = 0; i < count && i < CONFIG_AES67_MAX_SOURCES; i++) {
-        aes67_source_t src;
-        if (aes67_session_get_source(sess, i, &src) != ESP_OK) {
-            continue;
-        }
-        if (!src.enabled) {
-            continue;
-        }
-
-        /* Get RTP stream stats if available */
-        aes67_rtp_stream_status_t rtp_st = {0};
-        if (src.rtp_stream) {
-            aes67_rtp_stream_get_status(src.rtp_stream, &rtp_st);
-        }
-
-        if (!first) {
-            buf[pos++] = ',';
-        }
-        first = false;
-
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos,
-            "{"
-            "\"id\":%u,"
-            "\"name\":\"%s\","
-            "\"channels\":%u,"
-            "\"sample_rate\":%lu,"
-            "\"codec\":\"%s\","
-            "\"packets_sent\":%lu"
-            "}",
-            src.id, src.name,
-            src.rtp_config.channels,
-            (unsigned long)src.rtp_config.sample_rate,
-            codec_name(src.rtp_config.codec),
-            (unsigned long)rtp_st.packets_sent);
-
-        if (pos >= JSON_BUF_SIZE - 128) {
-            break;
-        }
-    }
-
-    buf[pos++] = ']';
-    buf[pos] = '\0';
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, buf, pos);
-    free(buf);
-    return ESP_OK;
+    jbuf_t jb;
+    jb_init(&jb, ctx->json, JSON_BUF_SIZE);
+    json_sources_array(&jb, ctx);
+    return send_json(req, &jb);
 }
-
-/* ---- GET /api/sinks ---- */
 
 static esp_err_t handler_api_sinks(httpd_req_t *req)
 {
     struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
-    char *buf = malloc(JSON_BUF_SIZE);
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    aes67_session_handle_t sess = NULL;
-    aes67_node_get_session(ctx->node, &sess);
-
-    int pos = 0;
-    buf[pos++] = '[';
-
-    int count = sess ? aes67_session_get_sink_count(sess) : 0;
-    bool first = true;
-
-    for (int i = 0; i < count && i < CONFIG_AES67_MAX_SINKS; i++) {
-        aes67_sink_t sink;
-        if (aes67_session_get_sink(sess, i, &sink) != ESP_OK) {
-            continue;
-        }
-        if (!sink.enabled) {
-            continue;
-        }
-
-        aes67_rtp_stream_status_t rtp_st = {0};
-        if (sink.rtp_stream) {
-            aes67_rtp_stream_get_status(sink.rtp_stream, &rtp_st);
-        }
-
-        if (!first) {
-            buf[pos++] = ',';
-        }
-        first = false;
-
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos,
-            "{"
-            "\"id\":%u,"
-            "\"name\":\"%s\","
-            "\"channels\":%u,"
-            "\"sample_rate\":%lu,"
-            "\"codec\":\"%s\","
-            "\"packets_received\":%lu,"
-            "\"packets_lost\":%lu,"
-            "\"jitter_us\":%ld,"
-            "\"receiving\":%s"
-            "}",
-            sink.id, sink.name,
-            sink.rtp_config.channels,
-            (unsigned long)sink.rtp_config.sample_rate,
-            codec_name(sink.rtp_config.codec),
-            (unsigned long)rtp_st.packets_received,
-            (unsigned long)rtp_st.packets_lost,
-            (long)rtp_st.jitter_us,
-            (rtp_st.status_flags & AES67_RTP_STATUS_RECEIVING) ? "true" : "false");
-
-        if (pos >= JSON_BUF_SIZE - 128) {
-            break;
-        }
-    }
-
-    buf[pos++] = ']';
-    buf[pos] = '\0';
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, buf, pos);
-    free(buf);
-    return ESP_OK;
+    jbuf_t jb;
+    jb_init(&jb, ctx->json, JSON_BUF_SIZE);
+    json_sinks_array(&jb, ctx);
+    return send_json(req, &jb);
 }
-
-/* ---- GET /api/sap/remotes ---- */
 
 static esp_err_t handler_api_sap_remotes(httpd_req_t *req)
 {
     struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
-    char *buf = malloc(JSON_BUF_SIZE);
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    aes67_sap_handle_t sap = NULL;
-    aes67_node_get_sap(ctx->node, &sap);
-
-    int pos = 0;
-    buf[pos++] = '[';
-
-    int count = sap ? aes67_sap_get_remote_count(sap) : 0;
-    bool first = true;
-
-    for (int i = 0; i < count; i++) {
-        aes67_sap_remote_source_t remote;
-        if (aes67_sap_get_remote(sap, i, &remote) != ESP_OK) {
-            continue;
-        }
-
-        if (!first) {
-            buf[pos++] = ',';
-        }
-        first = false;
-
-        char origin_str[16];
-        aes67_net_u32_to_ip(remote.origin_ip, origin_str, sizeof(origin_str));
-
-        pos += snprintf(buf + pos, JSON_BUF_SIZE - pos,
-            "{"
-            "\"name\":\"%s\","
-            "\"origin\":\"%s\","
-            "\"msg_id\":%u"
-            "}",
-            remote.name,
-            origin_str,
-            remote.msg_id);
-
-        if (pos >= JSON_BUF_SIZE - 128) {
-            break;
-        }
-    }
-
-    buf[pos++] = ']';
-    buf[pos] = '\0';
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, buf, pos);
-    free(buf);
-    return ESP_OK;
+    jbuf_t jb;
+    jb_init(&jb, ctx->json, JSON_BUF_SIZE);
+    json_remotes_array(&jb, ctx);
+    return send_json(req, &jb);
 }
 
 /* ---- POST /api/sinks : subscribe to remote source ---- */
@@ -645,16 +644,14 @@ static void webui_close_fn(httpd_handle_t hd, int fd)
 /* ---- Status push ---- */
 
 /*
- * Build the status frame. Runs in the server task (see ws_push_work), so
- * the heavy copy-outs use ctx->scratch instead of the stack.
+ * Build the status frame from the shared fragments. Runs in the server
+ * task (see ws_push_work). Returns the length, or 0 if even the fixed part
+ * did not fit. Arrays cut short are reported as "truncated":true.
  */
 static int build_status_frame(struct aes67_webui *ctx, char *buf, size_t cap)
 {
-    struct webui_scratch *sc = ctx->scratch;
-
-    int64_t uptime_us = esp_timer_get_time();
-    uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
-    uint32_t heap_free = esp_get_free_heap_size();
+    jbuf_t jb;
+    jb_init(&jb, buf, cap);
 
     aes67_ptp_handle_t ptp = NULL;
     aes67_node_get_ptp(ctx->node, &ptp);
@@ -663,152 +660,34 @@ static int build_status_frame(struct aes67_webui *ctx, char *buf, size_t cap)
         aes67_ptp_get_status(ptp, &ptp_st);
     }
 
-    char gm_str[24];
-    snprintf(gm_str, sizeof(gm_str),
-             "%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X",
-             ptp_st.grandmaster_id[0], ptp_st.grandmaster_id[1],
-             ptp_st.grandmaster_id[2], ptp_st.grandmaster_id[3],
-             ptp_st.grandmaster_id[4], ptp_st.grandmaster_id[5],
-             ptp_st.grandmaster_id[6], ptp_st.grandmaster_id[7]);
+    jb_printf(&jb, "{\"t\":\"status\",\"uptime\":%lu,\"heap_free\":%lu,\"ptp\":",
+              (unsigned long)(esp_timer_get_time() / 1000000),
+              (unsigned long)esp_get_free_heap_size());
+    json_ptp_object(&jb, &ptp_st);
 
-    /* We are GM if locked with zero offset and zero path delay
-     * (a slave always has non-zero offset/delay from the master) */
-    bool is_gm = (ptp_st.lock_state == AES67_PTP_LOCKED &&
-                  ptp_st.offset_ns == 0 && ptp_st.path_delay_ns == 0);
+    bool complete = true;
+    jb_printf(&jb, ",\"sources\":");
+    complete &= json_sources_array(&jb, ctx);
+    jb_printf(&jb, ",\"sinks\":");
+    complete &= json_sinks_array(&jb, ctx);
+    jb_printf(&jb, ",\"sap_remotes\":");
+    complete &= json_remotes_array(&jb, ctx);
 
-    int pos = snprintf(buf, cap,
-        "{"
-        "\"t\":\"status\","
-        "\"uptime\":%lu,"
-        "\"heap_free\":%lu,"
-        "\"ptp\":{\"lock\":\"%s\",\"gm\":\"%s\",\"is_gm\":%s,\"offset\":%ld,\"jitter\":%ld,\"delay\":%ld},",
-        (unsigned long)uptime_s,
-        (unsigned long)heap_free,
-        ptp_lock_str(ptp_st.lock_state),
-        gm_str,
-        is_gm ? "true" : "false",
-        (long)ptp_st.offset_ns,
-        (long)ptp_st.jitter_ns,
-        (long)ptp_st.path_delay_ns);
-
-    aes67_session_handle_t sess = NULL;
-    aes67_node_get_session(ctx->node, &sess);
-
-    pos += snprintf(buf + pos, cap - pos, "\"sources\":[");
-    if (sess) {
-        bool first = true;
-        int src_count = aes67_session_get_source_count(sess);
-        for (int i = 0; i < src_count && i < CONFIG_AES67_MAX_SOURCES; i++) {
-            aes67_source_t *src = &sc->src;
-            if (aes67_session_get_source(sess, i, src) != ESP_OK || !src->enabled) {
-                continue;
-            }
-            aes67_rtp_stream_status_t rtp_st = {0};
-            if (src->rtp_stream) {
-                aes67_rtp_stream_get_status(src->rtp_stream, &rtp_st);
-            }
-            if (!first) buf[pos++] = ',';
-            first = false;
-            pos += snprintf(buf + pos, cap - pos,
-                "{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"rate\":%lu,"
-                "\"ch\":%u,\"ptime\":%u,\"tx\":%lu}",
-                src->id, src->name, aes67_codec_to_str(src->rtp_config.codec),
-                (unsigned long)src->rtp_config.sample_rate,
-                src->rtp_config.channels,
-                src->rtp_config.packet_time_us,
-                (unsigned long)rtp_st.packets_sent);
-            if (pos >= (int)cap - 256) break;
-        }
-    }
-    pos += snprintf(buf + pos, cap - pos, "],");
-
-    pos += snprintf(buf + pos, cap - pos, "\"sinks\":[");
-    if (sess) {
-        bool first = true;
-        int sink_count = aes67_session_get_sink_count(sess);
-        for (int i = 0; i < sink_count && i < CONFIG_AES67_MAX_SINKS; i++) {
-            aes67_sink_t *sink = &sc->sink;
-            if (aes67_session_get_sink(sess, i, sink) != ESP_OK || !sink->enabled) {
-                continue;
-            }
-            aes67_rtp_stream_status_t rtp_st = {0};
-            if (sink->rtp_stream) {
-                aes67_rtp_stream_get_status(sink->rtp_stream, &rtp_st);
-            }
-            if (!first) buf[pos++] = ',';
-            first = false;
-            /* Use Ethernet hook counters for sink stats since the hook
-             * intercepts RTP at L2 before the RTP engine sees packets */
-            extern uint32_t s_hook_pkt_count;
-            extern uint32_t s_hook_seq_lost;
-            bool active = s_hook_pkt_count > 0;
-            pos += snprintf(buf + pos, cap - pos,
-                "{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"rate\":%lu,"
-                "\"ch\":%u,\"ptime\":%u,\"rx\":%lu,\"lost\":%lu,"
-                "\"jitter\":%ld,\"active\":%s}",
-                sink->id, sink->name, aes67_codec_to_str(sink->rtp_config.codec),
-                (unsigned long)sink->rtp_config.sample_rate,
-                sink->rtp_config.channels,
-                sink->rtp_config.packet_time_us,
-                (unsigned long)s_hook_pkt_count,
-                (unsigned long)s_hook_seq_lost,
-                (long)rtp_st.jitter_us,
-                active ? "true" : "false");
-            if (pos >= (int)cap - 256) break;
-        }
-    }
-    pos += snprintf(buf + pos, cap - pos, "],");
-
-    aes67_sap_handle_t sap = NULL;
-    aes67_node_get_sap(ctx->node, &sap);
-
-    pos += snprintf(buf + pos, cap - pos, "\"sap_remotes\":[");
-    if (sap) {
-        bool first = true;
-        int rcount = aes67_sap_get_remote_count(sap);
-        for (int i = 0; i < rcount; i++) {
-            aes67_sap_remote_source_t *remote = &sc->remote;
-            if (aes67_sap_get_remote(sap, i, remote) != ESP_OK) {
-                continue;
-            }
-            char origin_str[16];
-            aes67_net_u32_to_ip(remote->origin_ip, origin_str, sizeof(origin_str));
-            if (!first) buf[pos++] = ',';
-            first = false;
-            const char *codec_str = "?";
-            uint32_t rate = 0;
-            uint8_t ch = 0;
-            uint16_t ptime = 0;
-            memset(&sc->sdp, 0, sizeof(sc->sdp));
-            if (aes67_sdp_parse(remote->sdp, &sc->sdp) == ESP_OK) {
-                codec_str = aes67_codec_to_str(sc->sdp.codec);
-                rate = sc->sdp.sample_rate;
-                ch = sc->sdp.channels;
-                ptime = sc->sdp.ptime_us;
-            }
-            pos += snprintf(buf + pos, cap - pos,
-                "{\"name\":\"%s\",\"origin\":\"%s\",\"codec\":\"%s\","
-                "\"rate\":%lu,\"ch\":%u,\"ptime\":%u}",
-                remote->name, origin_str, codec_str,
-                (unsigned long)rate, ch, ptime);
-            if (pos >= (int)cap - 128) break;
-        }
-    }
-    pos += snprintf(buf + pos, cap - pos, "]");
-
-    /* Ethernet hook stats (defined in main.c) */
+    /* Ethernet hook stats (defined in the example's main.c for now) */
     extern uint32_t s_hook_pkt_count;
     extern uint32_t s_hook_seq_lost;
     extern uint32_t s_hook_total_frames;
-    pos += snprintf(buf + pos, cap - pos,
-        ",\"eth\":{\"rtp\":%lu,\"total\":%lu,\"lost\":%lu}",
-        (unsigned long)s_hook_pkt_count,
-        (unsigned long)s_hook_total_frames,
-        (unsigned long)s_hook_seq_lost);
+    jb_printf(&jb, ",\"eth\":{\"rtp\":%lu,\"total\":%lu,\"lost\":%lu},\"truncated\":%s}",
+              (unsigned long)s_hook_pkt_count,
+              (unsigned long)s_hook_total_frames,
+              (unsigned long)s_hook_seq_lost,
+              complete ? "false" : "true");
 
-    buf[pos++] = '}';
-    buf[pos] = '\0';
-    return pos;
+    if (jb.overflow) {
+        ESP_LOGW(TAG, "status frame exceeds %u bytes", (unsigned)cap);
+        return 0;
+    }
+    return (int)jb.len;
 }
 
 /*
@@ -887,7 +766,10 @@ esp_err_t aes67_webui_init(aes67_node_handle_t node, uint16_t port,
     ctx->httpd = NULL;
     ctx->running = false;
     ctx->scratch = calloc(1, sizeof(struct webui_scratch));
-    ctx->json = malloc(JSON_BUF_SIZE);
+    ctx->json = heap_caps_malloc(JSON_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ctx->json) {
+        ctx->json = malloc(JSON_BUF_SIZE);
+    }
     if (!ctx->scratch || !ctx->json) {
         free(ctx->scratch);
         free(ctx->json);

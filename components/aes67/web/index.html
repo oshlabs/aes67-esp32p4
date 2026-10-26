@@ -104,7 +104,7 @@ function fmtTime(us){
   if(us>=1000){var ms=us/1000;return(ms%1?ms.toFixed(3).replace(/0+$/,''):ms.toFixed(0))+"ms"}
   return us+"\u00b5s";
 }
-function fc(s){return(s.codec||"?")+" / "+(s.rate?fmt(s.rate)+"Hz":"?")+" / "+(s.ch||"?")+"ch / "+fmtTime(s.ptime)}
+function fc(s){return(s.codec||"?")+" / "+(s.sample_rate?fmt(s.sample_rate)+"Hz":"?")+" / "+(s.channels||"?")+"ch / "+fmtTime(s.ptime_us)}
 
 /* Build all slot DOM once at init. Source slots and sink slots share structure
    but sinks get edit panel + delete button. IDs follow the spec:
@@ -161,16 +161,16 @@ function updateSlots(prefix,arr){
     if(data){
       any=true;
       slot.style.display="block";
-      var on=prefix==="src"?true:data.active;
+      var on=prefix==="src"?true:data.receiving;
       g(prefix+"-"+i+"-dot").className="dot "+(on?"dg":"dr");
       g(prefix+"-"+i+"-name").textContent=data.name||"--";
       g(prefix+"-"+i+"-codec").textContent=fc(data);
       if(prefix==="src"){
-        g("src-"+i+"-tx").textContent=fmt(data.tx);
+        g("src-"+i+"-tx").textContent=fmt(data.packets_sent);
       }else{
-        g("sink-"+i+"-rx").textContent=fmt(data.rx);
-        g("sink-"+i+"-lost").textContent=fmt(data.lost);
-        g("sink-"+i+"-jitter").textContent=fmt(data.jitter);
+        g("sink-"+i+"-rx").textContent=fmt(data.packets_received);
+        g("sink-"+i+"-lost").textContent=fmt(data.packets_lost);
+        g("sink-"+i+"-jitter").textContent=fmt(data.jitter_us);
         var ni=g("edit-sink-name-"+i);
         if(ni&&document.activeElement!==ni)ni.value=data.name||"";
       }
@@ -189,7 +189,7 @@ function renderRemotes(arr){
   var h="";
   for(var i=0;i<arr.length;i++){
     var r=arr[i];
-    var info=r.codec?(esc(r.codec)+' / '+fmt(r.rate)+'Hz / '+r.ch+'ch / '+fmtTime(r.ptime)):'';
+    var info=r.codec?(esc(r.codec)+' / '+fmt(r.sample_rate)+'Hz / '+r.channels+'ch / '+fmtTime(r.ptime_us)):'';
     h+='<div class="re"><span>'+esc(r.name)+' <span class="lbl">('+esc(r.origin)+')</span>'+(info?' <span class="lbl">'+info+'</span>':'')+'</span><button class="btn" onclick="sR(\''+esc(r.origin)+"','"+esc(r.name)+'\')">Subscribe</button></div>';
   }
   c.innerHTML=h;
@@ -199,16 +199,16 @@ function onMsg(e){
   var d;try{d=JSON.parse(e.data)}catch(x){return}
   if(d.t!=="status")return;
   var p=d.ptp||{};
-  g("pd").className="dot "+dc(p.lock);
-  g("pl").textContent=p.lock||"Unknown";
-  g("pg").textContent=p.gm||"--";
+  g("pd").className="dot "+dc(p.lock_state);
+  g("pl").textContent=p.lock_state||"Unknown";
+  g("pg").textContent=p.grandmaster||"--";
   var pt=g("pt");
   if(p.is_gm){pt.textContent="GRANDMASTER";pt.className="tag tag-gm";pt.style.display=""}
-  else if(p.lock==="locked"){pt.textContent="SLAVE";pt.className="tag tag-slave";pt.style.display=""}
+  else if(p.lock_state==="locked"){pt.textContent="SLAVE";pt.className="tag tag-slave";pt.style.display=""}
   else{pt.style.display="none"}
-  g("po").textContent=fmt(p.offset);
-  g("pj").textContent=fmt(p.jitter);
-  g("py").textContent=fmt(p.delay);
+  g("po").textContent=fmt(p.offset_ns);
+  g("pj").textContent=fmt(p.jitter_ns);
+  g("py").textContent=fmt(p.path_delay_ns);
   updateSlots("src",d.sources);
   updateSlots("sink",d.sinks);
   renderRemotes(d.sap_remotes);
