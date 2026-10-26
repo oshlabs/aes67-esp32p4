@@ -1083,9 +1083,39 @@ esp_err_t aes67_rtp_engine_process_tx(aes67_rtp_engine_handle_t handle,
          * increment sequentially. The receiver validates that each
          * packet's timestamp = prev_timestamp + prev_sample_count.
          * (RAVENNA RTP_audio_stream.c line 647) */
+        /* The audio in this packet was captured during the previous
+         * frame period, so stamp it one packet behind the PTP-derived
+         * "now" (quantized to the packet grid). Receivers then measure a
+         * small positive network delay instead of a zero or negative one. */
+        uint32_t spp = s->samples_per_packet;
+        uint32_t ptp_ts = rtp_timestamp - (rtp_timestamp % spp) - spp;
+
         if (!s->timestamp_initialized) {
-            s->rtp_timestamp = rtp_timestamp;
+            s->rtp_timestamp = ptp_ts;
             s->timestamp_initialized = true;
+        } else {
+            /* Stay anchored to PTP: receivers (AES67/RAVENNA) compute
+             * playout from RTP timestamp vs. their own PTP time, so a
+             * timestamp seeded before PTP sync, or left behind by a clock
+             * step or underruns, makes every packet "late" and dropped.
+             * Re-anchor to the PTP-derived value, quantized to the packet
+             * grid, when the running timestamp deviates by more than a
+             * few packets. Small deviations keep sequential continuity. */
+            int32_t diff = (int32_t)(ptp_ts - s->rtp_timestamp);
+            int32_t limit = (int32_t)(spp * 4);
+            if (diff > limit || diff < -limit) {
+                /* Log at most once per 10 s: a blocking UART print here
+                 * costs several ticks and would re-trigger this path. */
+                static int64_t s_last_log_us;
+                int64_t now_us = esp_timer_get_time();
+                if (now_us - s_last_log_us > 10000000LL) {
+                    s_last_log_us = now_us;
+                    ESP_LOGW(TAG, "stream [%d] RTP timestamp re-anchored to PTP (off by %ld samples)",
+                             i, (long)diff);
+                }
+                s->status.timestamp_resyncs++;
+                s->rtp_timestamp = ptp_ts;
+            }
         }
 
         /* Ring buffer stores int32_t samples (4 bytes each, native endian).
@@ -1096,7 +1126,12 @@ esp_err_t aes67_rtp_engine_process_tx(aes67_rtp_engine_handle_t handle,
         /* Check if we have enough data in the ring buffer */
         uint32_t avail = ringbuf_available(&s->ring);
         if (avail < needed_bytes) {
+            /* Capture underrun: skip this packet but keep media time
+             * moving, so the stream reads as one lost packet instead of
+             * sliding behind PTP time. */
             s->status.status_flags |= AES67_RTP_STATUS_UNDERFLOW;
+            s->seq_num++;
+            s->rtp_timestamp += s->samples_per_packet;
             continue;
         }
 

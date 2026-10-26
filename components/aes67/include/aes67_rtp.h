@@ -71,6 +71,7 @@ typedef struct {
 typedef struct {
     uint32_t status_flags;          /* Bitmask of AES67_RTP_STATUS_* */
     uint32_t packets_sent;          /* Total packets transmitted */
+    uint32_t timestamp_resyncs; /* TX timestamp re-anchored to PTP */
     uint32_t packets_received;      /* Total packets received */
     uint32_t packets_lost;          /* Detected packet loss count */
     uint32_t packets_late;          /* Packets arriving after playout */
