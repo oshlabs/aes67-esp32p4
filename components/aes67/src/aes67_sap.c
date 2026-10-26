@@ -39,6 +39,7 @@ static const char *TAG = "aes67_sap";
 #define SAP_MAX_LOCAL         8
 #define SAP_MAX_REMOTE        16
 
+#define SAP_SELECT_TIMEOUT_S  1       /* bounds the stop latency and the expiry scan */
 #define SAP_RX_TASK_STACK     12288  /* Needs room for callback -> add_source -> SDP log */
 #define SAP_TX_TASK_STACK     4096
 #define SAP_RX_TASK_PRIO      5   /* Background - discovery */
@@ -57,6 +58,14 @@ struct aes67_sap_ctx {
     int sock;
     TaskHandle_t rx_task;
     TaskHandle_t tx_task;
+    SemaphoreHandle_t rx_done;   /* given by each task when it exits */
+    SemaphoreHandle_t tx_done;
+    /* Guards local[] and remote[]. The RX task compacts remote[] with
+     * memmove while announce/delete and the Web UI read the tables from
+     * other tasks. Callbacks are invoked with the lock released, on a copy,
+     * so they may call back into SAP. */
+    SemaphoreHandle_t lock;
+    aes67_sap_remote_source_t *event_copy;  /* RX task's copy for callbacks */
     bool running;
 
     aes67_sap_event_cb_t event_cb;
@@ -204,17 +213,20 @@ static void handle_sap_rx(struct aes67_sap_ctx *ctx, const uint8_t *data,
 
     bool is_delete = (flags & 0x04) != 0;
 
+    /* Event to deliver after the lock is released, if any */
+    aes67_sap_remote_source_t *event = ctx->event_copy;
+    bool have_event = false, event_is_announce = false;
+
+    xSemaphoreTake(ctx->lock, portMAX_DELAY);
     if (is_delete) {
         /* Remove this source */
         int idx = find_remote(ctx, origin_ip, msg_id);
         if (idx >= 0) {
-            aes67_sap_remote_source_t removed = ctx->remote[idx];
+            *event = ctx->remote[idx];
             remove_remote(ctx, idx);
+            have_event = true;
             ESP_LOGI(TAG, "Source gone: \"%s\" (%d sources remaining)",
-                     removed.name, ctx->remote_count);
-            if (ctx->event_cb) {
-                ctx->event_cb(false, &removed, ctx->user_data);
-            }
+                     event->name, ctx->remote_count);
         }
     } else {
         /* Announce: add or update */
@@ -233,6 +245,7 @@ static void handle_sap_rx(struct aes67_sap_ctx *ctx, const uint8_t *data,
         } else {
             /* New source */
             if (ctx->remote_count >= SAP_MAX_REMOTE) {
+                xSemaphoreGive(ctx->lock);
                 ESP_LOGW(TAG, "Remote source table full, ignoring new source");
                 return;
             }
@@ -261,29 +274,46 @@ static void handle_sap_rx(struct aes67_sap_ctx *ctx, const uint8_t *data,
 
             ESP_LOGI(TAG, "Discovered: \"%s\" from %s (%d sources on network)",
                      src->name, ip_str, ctx->remote_count);
-            if (ctx->event_cb) {
-                ctx->event_cb(true, src, ctx->user_data);
-            }
+            *event = *src;
+            have_event = true;
+            event_is_announce = true;
         }
+    }
+    xSemaphoreGive(ctx->lock);
+
+    if (have_event && ctx->event_cb) {
+        ctx->event_cb(event_is_announce, event, ctx->user_data);
     }
 }
 
 /* Check for timed-out remote sources (not seen within SAP_TIMEOUT_MS) */
 static void expire_remote_sources(struct aes67_sap_ctx *ctx)
 {
-    uint32_t now = xTaskGetTickCount();
     uint32_t timeout_ticks = pdMS_TO_TICKS(SAP_TIMEOUT_MS);
+    aes67_sap_remote_source_t *expired = ctx->event_copy;
 
-    for (int i = ctx->remote_count - 1; i >= 0; i--) {
-        uint32_t elapsed = now - ctx->remote[i].last_seen;
-        if (elapsed >= timeout_ticks) {
-            aes67_sap_remote_source_t expired = ctx->remote[i];
-            remove_remote(ctx, i);
-            ESP_LOGI(TAG, "Source timeout: \"%s\" (no announcement for %ds)",
-                     expired.name, SAP_TIMEOUT_MS / 1000);
-            if (ctx->event_cb) {
-                ctx->event_cb(false, &expired, ctx->user_data);
+    /* Remove one expired entry per pass under the lock, deliver the event
+     * with the lock released, repeat until none is left. */
+    for (;;) {
+        bool found = false;
+        xSemaphoreTake(ctx->lock, portMAX_DELAY);
+        uint32_t now = xTaskGetTickCount();
+        for (int i = ctx->remote_count - 1; i >= 0; i--) {
+            if (now - ctx->remote[i].last_seen >= timeout_ticks) {
+                *expired = ctx->remote[i];
+                remove_remote(ctx, i);
+                found = true;
+                break;
             }
+        }
+        xSemaphoreGive(ctx->lock);
+        if (!found) {
+            return;
+        }
+        ESP_LOGI(TAG, "Source timeout: \"%s\" (no announcement for %ds)",
+                 expired->name, SAP_TIMEOUT_MS / 1000);
+        if (ctx->event_cb) {
+            ctx->event_cb(false, expired, ctx->user_data);
         }
     }
 }
@@ -298,7 +328,8 @@ static void sap_rx_task(void *arg)
     uint8_t *rx_buf = malloc(SAP_RX_BUF_SIZE);
     if (!rx_buf) {
         ESP_LOGE(TAG, "Failed to allocate SAP RX buffer");
-        vTaskDelete(NULL);
+            xSemaphoreGive(ctx->rx_done);
+    vTaskDelete(NULL);
         return;
     }
 
@@ -307,7 +338,7 @@ static void sap_rx_task(void *arg)
     while (ctx->running) {
         /* Use a timeout so we can periodically check for expired sources */
         struct timeval tv = {
-            .tv_sec = 5,
+            .tv_sec = SAP_SELECT_TIMEOUT_S,
             .tv_usec = 0,
         };
         fd_set rfds;
@@ -337,6 +368,7 @@ static void sap_rx_task(void *arg)
 
     free(rx_buf);
     ESP_LOGI(TAG, "SAP RX task stopped");
+        xSemaphoreGive(ctx->rx_done);
     vTaskDelete(NULL);
 }
 
@@ -351,13 +383,16 @@ static void sap_tx_task(void *arg)
     while (ctx->running) {
         /* Announce all active local sources */
         for (int i = 0; i < SAP_MAX_LOCAL; i++) {
-            if (!ctx->local[i].active) continue;
-
-            int pkt_len = build_sap_packet(tx_buf, sizeof(tx_buf),
+            xSemaphoreTake(ctx->lock, portMAX_DELAY);
+            int pkt_len = -1;
+            if (ctx->local[i].active) {
+                pkt_len = build_sap_packet(tx_buf, sizeof(tx_buf),
                                            SAP_ANNOUNCE_FLAG,
                                            ctx->local[i].msg_id,
                                            ctx->local[i].origin_ip,
                                            ctx->local[i].sdp);
+            }
+            xSemaphoreGive(ctx->lock);
             if (pkt_len > 0) {
                 send_sap_packet(ctx->sock, tx_buf, pkt_len);
             }
@@ -370,6 +405,7 @@ static void sap_tx_task(void *arg)
     }
 
     ESP_LOGI(TAG, "SAP TX task stopped");
+        xSemaphoreGive(ctx->tx_done);
     vTaskDelete(NULL);
 }
 
@@ -389,6 +425,18 @@ esp_err_t aes67_sap_init(aes67_sap_handle_t *handle)
     ctx->user_data = NULL;
     ctx->local_count = 0;
     ctx->remote_count = 0;
+    ctx->lock = xSemaphoreCreateMutex();
+    ctx->rx_done = xSemaphoreCreateBinary();
+    ctx->tx_done = xSemaphoreCreateBinary();
+    ctx->event_copy = malloc(sizeof(aes67_sap_remote_source_t));
+    if (!ctx->lock || !ctx->rx_done || !ctx->tx_done || !ctx->event_copy) {
+        if (ctx->lock) vSemaphoreDelete(ctx->lock);
+        if (ctx->rx_done) vSemaphoreDelete(ctx->rx_done);
+        if (ctx->tx_done) vSemaphoreDelete(ctx->tx_done);
+        free(ctx->event_copy);
+        free(ctx);
+        return ESP_ERR_NO_MEM;
+    }
 
     *handle = ctx;
     ESP_LOGI(TAG, "SAP subsystem initialized");
@@ -457,8 +505,8 @@ esp_err_t aes67_sap_start(aes67_sap_handle_t handle)
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SAP TX task");
         handle->running = false;
-        /* Wait a bit for RX task to notice and exit */
-        vTaskDelay(pdMS_TO_TICKS(200));
+        xSemaphoreTake(handle->rx_done, pdMS_TO_TICKS(2000));
+        handle->rx_task = NULL;
         close(handle->sock);
         handle->sock = -1;
         return ESP_ERR_NO_MEM;
@@ -476,8 +524,16 @@ esp_err_t aes67_sap_stop(aes67_sap_handle_t handle)
     ESP_LOGI(TAG, "Stopping SAP...");
     handle->running = false;
 
-    /* Give tasks time to exit their loops */
-    vTaskDelay(pdMS_TO_TICKS(500));
+    /* The RX task wakes on its select timeout, the TX task every 100 ms;
+     * wait for each to signal that it has left its loop. */
+    if (handle->rx_task &&
+        xSemaphoreTake(handle->rx_done, pdMS_TO_TICKS(SAP_SELECT_TIMEOUT_S * 1000 + 500)) != pdTRUE) {
+        ESP_LOGW(TAG, "SAP RX task did not exit in time");
+    }
+    if (handle->tx_task &&
+        xSemaphoreTake(handle->tx_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "SAP TX task did not exit in time");
+    }
 
     if (handle->sock >= 0) {
         aes67_net_leave_multicast(handle->sock, AES67_SAP_MCAST_ADDR, NULL);
@@ -500,6 +556,10 @@ esp_err_t aes67_sap_destroy(aes67_sap_handle_t handle)
         aes67_sap_stop(handle);
     }
 
+    vSemaphoreDelete(handle->lock);
+    vSemaphoreDelete(handle->rx_done);
+    vSemaphoreDelete(handle->tx_done);
+    free(handle->event_copy);
     free(handle);
     ESP_LOGI(TAG, "SAP context destroyed");
     return ESP_OK;
@@ -511,45 +571,53 @@ esp_err_t aes67_sap_announce(aes67_sap_handle_t handle,
 {
     if (!handle || !sdp) return ESP_ERR_INVALID_ARG;
 
-    /* Check if this msg_id is already registered */
+    xSemaphoreTake(handle->lock, portMAX_DELAY);
+    int slot = -1;
+    bool updated = false;
     for (int i = 0; i < SAP_MAX_LOCAL; i++) {
         if (handle->local[i].active && handle->local[i].msg_id == msg_id) {
-            /* Update existing entry */
-            strncpy(handle->local[i].sdp, sdp, AES67_SAP_MAX_SDP_LEN - 1);
-            handle->local[i].sdp[AES67_SAP_MAX_SDP_LEN - 1] = '\0';
-            handle->local[i].origin_ip = origin_ip;
-            ESP_LOGI(TAG, "Updated local source announcement (id=0x%04X)", msg_id);
-            return ESP_OK;
+            slot = i;
+            updated = true;
+            break;
         }
     }
-
-    /* Find a free slot */
-    for (int i = 0; i < SAP_MAX_LOCAL; i++) {
-        if (!handle->local[i].active) {
-            handle->local[i].active = true;
-            handle->local[i].msg_id = msg_id;
-            handle->local[i].origin_ip = origin_ip;
-            strncpy(handle->local[i].sdp, sdp, AES67_SAP_MAX_SDP_LEN - 1);
-            handle->local[i].sdp[AES67_SAP_MAX_SDP_LEN - 1] = '\0';
-            handle->local_count++;
-            ESP_LOGI(TAG, "Added local source announcement (id=0x%04X)", msg_id);
-
-            /* Send an immediate announcement if already running */
-            if (handle->running && handle->sock >= 0) {
-                uint8_t pkt[SAP_RX_BUF_SIZE];
-                int pkt_len = build_sap_packet(pkt, sizeof(pkt),
-                                               SAP_ANNOUNCE_FLAG,
-                                               msg_id, origin_ip, sdp);
-                if (pkt_len > 0) {
-                    send_sap_packet(handle->sock, pkt, pkt_len);
-                }
+    if (slot < 0) {
+        for (int i = 0; i < SAP_MAX_LOCAL; i++) {
+            if (!handle->local[i].active) {
+                slot = i;
+                break;
             }
-            return ESP_OK;
         }
     }
+    if (slot < 0) {
+        xSemaphoreGive(handle->lock);
+        ESP_LOGE(TAG, "Local source table full (max %d)", SAP_MAX_LOCAL);
+        return ESP_ERR_NO_MEM;
+    }
+    handle->local[slot].active = true;
+    handle->local[slot].msg_id = msg_id;
+    handle->local[slot].origin_ip = origin_ip;
+    strncpy(handle->local[slot].sdp, sdp, AES67_SAP_MAX_SDP_LEN - 1);
+    handle->local[slot].sdp[AES67_SAP_MAX_SDP_LEN - 1] = '\0';
+    if (!updated) {
+        handle->local_count++;
+    }
+    xSemaphoreGive(handle->lock);
 
-    ESP_LOGE(TAG, "Local source table full (max %d)", SAP_MAX_LOCAL);
-    return ESP_ERR_NO_MEM;
+    ESP_LOGI(TAG, "%s local source announcement (id=0x%04X)",
+             updated ? "Updated" : "Added", msg_id);
+
+    /* Send an immediate announcement if already running */
+    if (!updated && handle->running && handle->sock >= 0) {
+        uint8_t pkt[SAP_RX_BUF_SIZE];
+        int pkt_len = build_sap_packet(pkt, sizeof(pkt),
+                                       SAP_ANNOUNCE_FLAG,
+                                       msg_id, origin_ip, sdp);
+        if (pkt_len > 0) {
+            send_sap_packet(handle->sock, pkt, pkt_len);
+        }
+    }
+    return ESP_OK;
 }
 
 esp_err_t aes67_sap_delete(aes67_sap_handle_t handle,
@@ -570,15 +638,21 @@ esp_err_t aes67_sap_delete(aes67_sap_handle_t handle,
     }
 
     /* Remove from local source table */
+    bool found = false;
+    xSemaphoreTake(handle->lock, portMAX_DELAY);
     for (int i = 0; i < SAP_MAX_LOCAL; i++) {
         if (handle->local[i].active && handle->local[i].msg_id == msg_id) {
             handle->local[i].active = false;
             handle->local_count--;
-            ESP_LOGI(TAG, "Removed local source (id=0x%04X)", msg_id);
-            return ESP_OK;
+            found = true;
+            break;
         }
     }
-
+    xSemaphoreGive(handle->lock);
+    if (found) {
+        ESP_LOGI(TAG, "Removed local source (id=0x%04X)", msg_id);
+        return ESP_OK;
+    }
     ESP_LOGW(TAG, "Local source id=0x%04X not found for deletion", msg_id);
     return ESP_ERR_NOT_FOUND;
 }
@@ -595,15 +669,22 @@ esp_err_t aes67_sap_register_cb(aes67_sap_handle_t handle,
 int aes67_sap_get_remote_count(aes67_sap_handle_t handle)
 {
     if (!handle) return 0;
-    return handle->remote_count;
+    xSemaphoreTake(handle->lock, portMAX_DELAY);
+    int n = handle->remote_count;
+    xSemaphoreGive(handle->lock);
+    return n;
 }
 
 esp_err_t aes67_sap_get_remote(aes67_sap_handle_t handle, int index,
                                aes67_sap_remote_source_t *source)
 {
     if (!handle || !source) return ESP_ERR_INVALID_ARG;
-    if (index < 0 || index >= handle->remote_count) return ESP_ERR_NOT_FOUND;
-
+    xSemaphoreTake(handle->lock, portMAX_DELAY);
+    if (index < 0 || index >= handle->remote_count) {
+        xSemaphoreGive(handle->lock);
+        return ESP_ERR_NOT_FOUND;
+    }
     *source = handle->remote[index];
+    xSemaphoreGive(handle->lock);
     return ESP_OK;
 }

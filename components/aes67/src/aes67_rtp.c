@@ -84,6 +84,7 @@ struct aes67_rtp_engine {
      * both cores. Every access to the table or to a stream reached through
      * it holds this mutex. Hold times are one tick's worth of work. */
     SemaphoreHandle_t lock;
+    SemaphoreHandle_t rx_done;     /* given by the RX task when it exits */
     struct aes67_rtp_stream *streams[AES67_MAX_STREAMS];
     int stream_count;
     int rx_sock;
@@ -441,7 +442,8 @@ static void rx_task_func(void *arg)
                                        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!rx_buf) {
         ESP_LOGE(TAG, "Failed to allocate RX buffer");
-        vTaskDelete(NULL);
+            xSemaphoreGive(engine->rx_done);
+    vTaskDelete(NULL);
         return;
     }
 
@@ -453,7 +455,8 @@ static void rx_task_func(void *arg)
     if (!sample_buf) {
         ESP_LOGE(TAG, "Failed to allocate sample conversion buffer");
         heap_caps_free(rx_buf);
-        vTaskDelete(NULL);
+            xSemaphoreGive(engine->rx_done);
+    vTaskDelete(NULL);
         return;
     }
 
@@ -630,6 +633,7 @@ static void rx_task_func(void *arg)
     heap_caps_free(sample_buf);
     heap_caps_free(rx_buf);
     ESP_LOGI(TAG, "RX task stopped");
+        xSemaphoreGive(engine->rx_done);
     vTaskDelete(NULL);
 }
 
@@ -657,8 +661,11 @@ esp_err_t aes67_rtp_engine_init(const aes67_net_config_t *net_config,
     engine->stream_count = 0;
 
     engine->lock = xSemaphoreCreateMutex();
-    if (!engine->lock) {
-        ESP_LOGE(TAG, "Failed to create stream table lock");
+    engine->rx_done = xSemaphoreCreateBinary();
+    if (!engine->lock || !engine->rx_done) {
+        ESP_LOGE(TAG, "Failed to create engine semaphores");
+        if (engine->lock) vSemaphoreDelete(engine->lock);
+        if (engine->rx_done) vSemaphoreDelete(engine->rx_done);
         free(engine);
         return ESP_ERR_NO_MEM;
     }
@@ -800,10 +807,12 @@ esp_err_t aes67_rtp_engine_stop(aes67_rtp_engine_handle_t handle)
 
     engine->running = false;
 
-    /* The RX task will exit on the next recvfrom timeout */
+    /* The RX task sees the flag on its next 100 ms receive timeout and
+     * signals rx_done on the way out; wait for that instead of guessing. */
     if (engine->rx_task) {
-        /* Give the task time to notice the flag and exit */
-        vTaskDelay(pdMS_TO_TICKS(200));
+        if (xSemaphoreTake(engine->rx_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGW(TAG, "RX task did not exit within 1 s");
+        }
         engine->rx_task = NULL;
     }
 
@@ -838,6 +847,7 @@ esp_err_t aes67_rtp_engine_destroy(aes67_rtp_engine_handle_t handle)
     }
 
     vSemaphoreDelete(engine->lock);
+    vSemaphoreDelete(engine->rx_done);
     free(engine);
     ESP_LOGI(TAG, "Engine destroyed");
     return ESP_OK;

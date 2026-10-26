@@ -51,6 +51,7 @@ struct aes67_ptp_ctx {
     aes67_ptp_lock_cb_t lock_cb;
     void *lock_cb_user_data;
     TaskHandle_t monitor_task;
+    SemaphoreHandle_t monitor_done;   /* given by the monitor task on exit */
     bool running;
 
     /* Grandmaster identity from last status poll */
@@ -252,6 +253,7 @@ static void ptp_monitor_task(void *arg)
     }
 
     ESP_LOGI(TAG, "PTP monitor task exiting");
+        xSemaphoreGive(ctx->monitor_done);
     vTaskDelete(NULL);
 }
 
@@ -271,6 +273,11 @@ esp_err_t aes67_ptp_init(esp_eth_handle_t eth_handle, const aes67_ptp_config_t *
 
     ctx->eth_handle = eth_handle;
     ctx->config = *config;
+    ctx->monitor_done = xSemaphoreCreateBinary();
+    if (!ctx->monitor_done) {
+        free(ctx);
+        return ESP_ERR_NO_MEM;
+    }
     ctx->lock_state = AES67_PTP_UNLOCKED;
     ctx->ptpd_pid = -1;
     ctx->running = false;
@@ -359,8 +366,12 @@ esp_err_t aes67_ptp_stop(aes67_ptp_handle_t handle)
     /* Signal the monitor task to stop, then wait for it to exit */
     handle->running = false;
 
-    /* Give the monitor task time to notice the flag and exit */
-    vTaskDelay(pdMS_TO_TICKS(PTP_MONITOR_INTERVAL_MS + 100));
+    /* The monitor wakes every PTP_MONITOR_INTERVAL_MS; wait for it to
+     * signal that it has left its loop. */
+    if (handle->monitor_task &&
+        xSemaphoreTake(handle->monitor_done, pdMS_TO_TICKS(PTP_MONITOR_INTERVAL_MS * 3)) != pdTRUE) {
+        ESP_LOGW(TAG, "PTP monitor task did not exit in time");
+    }
     handle->monitor_task = NULL;
 
     /* Stop the ptpd daemon */

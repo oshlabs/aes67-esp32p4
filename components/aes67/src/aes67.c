@@ -53,6 +53,9 @@ struct aes67_node {
     aes67_audio_handle_t        audio;
     aes67_session_handle_t      session;
     TaskHandle_t                tx_task;
+    TaskHandle_t                pb_task;
+    SemaphoreHandle_t           tic_done;   /* given by the TIC task on exit */
+    SemaphoreHandle_t           pb_done;    /* given by the playback task on exit */
     StreamBufferHandle_t        external_playout_buf;  /* optional, see aes67_node_set_playout_buf */
     bool                        running;
 };
@@ -157,6 +160,7 @@ static void audio_frame_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Audio frame task stopped");
+        xSemaphoreGive(node->tic_done);
     vTaskDelete(NULL);
 }
 
@@ -181,7 +185,8 @@ static void playback_task(void *arg)
     int32_t *pcm_buf = heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL);
     if (!pcm_buf) {
         ESP_LOGE(TAG, "Playback task: alloc failed");
-        vTaskDelete(NULL);
+            xSemaphoreGive(node->pb_done);
+    vTaskDelete(NULL);
         return;
     }
 
@@ -310,6 +315,7 @@ static void playback_task(void *arg)
 
     heap_caps_free(pcm_buf);
     ESP_LOGI(TAG, "Playback task stopped");
+        xSemaphoreGive(node->pb_done);
     vTaskDelete(NULL);
 }
 
@@ -399,8 +405,10 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
 
     /* Create the frame semaphore for ISR -> task signaling */
     s_frame_sem = xSemaphoreCreateBinary();
-    if (!s_frame_sem) {
-        ESP_LOGE(TAG, "failed to create frame semaphore");
+    node->tic_done = xSemaphoreCreateBinary();
+    node->pb_done = xSemaphoreCreateBinary();
+    if (!s_frame_sem || !node->tic_done || !node->pb_done) {
+        ESP_LOGE(TAG, "failed to create frame semaphores");
         goto fail_cb;
     }
 
@@ -505,10 +513,9 @@ esp_err_t aes67_node_start(aes67_node_handle_t handle)
      * For I2S mode, the DMA ISR reads directly from the stream buffer,
      * bypassing the playback task entirely (zero scheduling overhead). */
     if (handle->config.output_mode != AES67_OUTPUT_I2S) {
-        static TaskHandle_t pb_task = NULL;
         xTaskCreatePinnedToCore(playback_task, "aes67_pb", 8192, handle,
-                                21, &pb_task, 0);
-        aes67_rtp_engine_set_notify_task(handle->rtp, pb_task);
+                                21, &handle->pb_task, 0);
+        aes67_rtp_engine_set_notify_task(handle->rtp, handle->pb_task);
         ESP_LOGI(TAG, "Playback task started (output_mode=%d)", handle->config.output_mode);
     } else {
         ESP_LOGI(TAG, "I2S output via DMA ISR (no playback task needed)");
@@ -549,6 +556,24 @@ esp_err_t aes67_node_stop(aes67_node_handle_t handle)
         return ESP_OK;
     }
 
+    /* Stop the frame timer and let the TIC and playback tasks leave their
+     * loops before any subsystem they use is stopped. */
+    aes67_hw_timer_stop();
+    handle->running = false;
+    if (handle->tx_task) {
+        if (xSemaphoreTake(handle->tic_done, pdMS_TO_TICKS(500)) != pdTRUE) {
+            ESP_LOGW(TAG, "audio frame task did not exit in time");
+        }
+        handle->tx_task = NULL;
+    }
+    if (handle->pb_task) {
+        if (xSemaphoreTake(handle->pb_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGW(TAG, "playback task did not exit in time");
+        }
+        handle->pb_task = NULL;
+        aes67_rtp_engine_set_notify_task(handle->rtp, NULL);
+    }
+
     /* Tear down in reverse order */
     if (handle->config.mdns_enabled) {
         aes67_mdns_deinit();
@@ -563,7 +588,6 @@ esp_err_t aes67_node_stop(aes67_node_handle_t handle)
     aes67_rtp_engine_stop(handle->rtp);
     aes67_ptp_stop(handle->ptp);
 
-    handle->running = false;
     ESP_LOGI(TAG, "node stopped");
 
     return ESP_OK;

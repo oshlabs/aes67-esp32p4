@@ -78,6 +78,8 @@
 #include "esp_vfs_l2tap.h"
 #include "semaphore.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_err.h"
 #include "lwip/prot/ethernet.h" // Ethernet headers
 
@@ -287,6 +289,7 @@ static const char *TAG = "ptpd";
 
 #ifdef ESP_PTP
 static struct ptp_state_s *s_state;
+static SemaphoreHandle_t s_daemon_done = NULL;  /* given when the daemon task exits */
 #endif
 
 /****************************************************************************
@@ -959,6 +962,24 @@ static int ptp_destroy_state(FAR struct ptp_state_s *state)
   {
     close(state->ptp_socket);
     state->ptp_socket = -1;
+  }
+
+  /* The UDP sockets are created on this path too (ptp_initialize_state);
+   * leaving them open leaked three sockets per daemon stop. */
+  if (state->tx_socket > 0)
+  {
+    close(state->tx_socket);
+    state->tx_socket = -1;
+  }
+  if (state->event_socket > 0)
+  {
+    close(state->event_socket);
+    state->event_socket = -1;
+  }
+  if (state->info_socket > 0)
+  {
+    close(state->info_socket);
+    state->info_socket = -1;
   }
 #else
   struct in_addr mcast_addr;
@@ -2247,6 +2268,10 @@ static int ptp_daemon(int argc, FAR char** argv)
 #ifdef ESP_PTP
 err:
   s_state = NULL;
+  if (s_daemon_done)
+    {
+      xSemaphoreGive(s_daemon_done);
+    }
   vTaskDelete(NULL);
 #else
   return 0;
@@ -2276,6 +2301,10 @@ int ptpd_start(FAR const char *interface)
 {
 #ifdef ESP_PTP
   if (s_state == NULL) {
+    if (s_daemon_done == NULL)
+      {
+        s_daemon_done = xSemaphoreCreateBinary();
+      }
     xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
               (void *)interface, tskIDLE_PRIORITY + 2, NULL);
     return 1;
@@ -2422,7 +2451,20 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status)
 int ptpd_stop(int pid)
 {
 #ifdef ESP_PTP
+  if (s_state == NULL)
+    {
+      return -ESRCH;
+    }
   s_state->stop = true;
+  /* The daemon loop wakes at least every PTPD_POLL_INTERVAL ms; wait for
+   * it to tear down its state and signal, so a following ptpd_start does
+   * not race the old task for s_state and the sockets. */
+  if (s_daemon_done &&
+      xSemaphoreTake(s_daemon_done, pdMS_TO_TICKS(PTPD_POLL_INTERVAL * 8 + 500)) != pdTRUE)
+    {
+      ptperr("ptpd task did not exit in time\n");
+      return -ETIMEDOUT;
+    }
   return OK;
 #else
   if (kill(pid, SIGHUP) == OK)
