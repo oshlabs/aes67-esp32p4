@@ -107,6 +107,16 @@ idf.py build
 idf.py flash monitor
 ```
 
+Boards with ESP32-P4 silicon revision **v3.x** (newer ESP32-P4-ETH units report
+"revision v3.2" in `idf.py flash`) need ESP-IDF v5.5.2 or later and a build that
+selects chip revision v3.0 as minimum; such a build does not run on v1.x chips.
+Configure with the overlay once, the choice is cached in the build directory:
+
+```bash
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.p4v3" set-target esp32p4
+```
+
+
 ## Component Architecture
 
 ```

@@ -1,0 +1,5 @@
+# Overlay for ESP32-P4 silicon revision v3.x (e.g. Waveshare ESP32-P4-ETH boards
+# shipping with rev v3.2). v3.x needs ESP-IDF >= v5.5.2 and a build whose minimum
+# chip revision is v3.0; such a build does not run on v1.x chips.
+# Use: idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.p4v3" set-target esp32p4
+CONFIG_ESP32P4_REV_MIN_300=y
