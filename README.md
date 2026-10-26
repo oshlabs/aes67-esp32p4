@@ -120,6 +120,8 @@ Configure with the overlay once, the choice is cached in the build directory:
 idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.p4v3" set-target esp32p4
 ```
 
+`tools/` holds Python helpers to verify a node against a real AES67 receiver
+(wire probe, reference sender, receiver control); see `tools/README.md`.
 
 ## Component Architecture
 
