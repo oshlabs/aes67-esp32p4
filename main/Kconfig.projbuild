@@ -42,6 +42,20 @@ menu "AES67 Example"
         int "Power amplifier enable GPIO (-1 to disable)"
         default 53
 
+    config EXAMPLE_MIC_GAIN_DB
+        int "ES8311 microphone preamp gain (dB, 0..42 in 6 dB steps)"
+        range 0 42
+        default 6
+        help
+            Analog gain of the ES8311 microphone input. The onboard mic sits a few
+            centimetres from the speaker header, so high gain feeds back as soon as
+            a receiver plays this node's stream in the same room.
+
+    config EXAMPLE_SPEAKER_VOLUME
+        int "ES8311 playback volume (0..100)"
+        range 0 100
+        default 70
+
     config EXAMPLE_CREATE_MIC_SOURCE
         bool "Create a microphone source stream at boot"
         default y

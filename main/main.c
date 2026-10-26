@@ -494,7 +494,7 @@ static esp_err_t es8311_codec_init(void)
         return ret;
     }
 
-    ret = es8311_voice_volume_set(codec, 70, NULL);
+    ret = es8311_voice_volume_set(codec, CONFIG_EXAMPLE_SPEAKER_VOLUME, NULL);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ES8311 volume set failed: %s", esp_err_to_name(ret));
     }
@@ -505,14 +505,17 @@ static esp_err_t es8311_codec_init(void)
         ESP_LOGW(TAG, "ES8311 unmute failed: %s", esp_err_to_name(ret));
     }
 
-    /* Configure microphone: analog mic, 24dB gain */
+    /* Configure microphone: analog mic, gain from menuconfig (6 dB steps) */
     es8311_microphone_config(codec, false);
-    es8311_microphone_gain_set(codec, ES8311_MIC_GAIN_24DB);
+    es8311_microphone_gain_set(codec,
+        (es8311_mic_gain_t)(ES8311_MIC_GAIN_0DB + CONFIG_EXAMPLE_MIC_GAIN_DB / 6));
+    ESP_LOGI(TAG, "ES8311 mic gain %d dB, volume %d",
+             (CONFIG_EXAMPLE_MIC_GAIN_DB / 6) * 6, CONFIG_EXAMPLE_SPEAKER_VOLUME);
 
     /* Dump ES8311 register state for debugging */
     es8311_register_dump(codec);
 
-    ESP_LOGI(TAG, "ES8311 codec initialized (48kHz, 16-bit, MCLK=18.432MHz, vol=100)");
+    ESP_LOGI(TAG, "ES8311 codec initialized (48kHz, 32-bit slots, MCLK=18.432MHz)");
     return ESP_OK;
 }
 
