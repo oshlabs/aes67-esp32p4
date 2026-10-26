@@ -320,26 +320,25 @@ static bool json_sinks_array(jbuf_t *jb, struct aes67_webui *ctx)
         }
         aes67_rtp_stream_status_t rtp_st = {0};
         aes67_session_get_sink_status(sess, i, &rtp_st);
-        /* The Ethernet hook intercepts RTP at L2 before the engine sees
-         * packets, so its counters are the ones that move (defined in the
-         * example's main.c for now). */
-        extern uint32_t s_hook_pkt_count;
-        extern uint32_t s_hook_seq_lost;
         size_t mark = jb_mark(jb);
         bool ok = jb_printf(jb, "%s{\"id\":%u,\"name\":", first ? "" : ",", sink->id)
                && jb_quoted(jb, sink->name)
                && jb_printf(jb,
             ",\"codec\":\"%s\",\"sample_rate\":%lu,"
             "\"channels\":%u,\"ptime_us\":%u,\"packets_received\":%lu,"
-            "\"packets_lost\":%lu,\"jitter_us\":%ld,\"receiving\":%s}",
+            "\"packets_lost\":%lu,\"seq_errors\":%lu,\"jitter_us\":%ld,"
+            "\"ssrc\":%lu,\"ssrc_mismatches\":%lu,\"receiving\":%s}",
             codec_name(sink->rtp_config.codec),
             (unsigned long)sink->rtp_config.sample_rate,
             sink->rtp_config.channels,
             sink->rtp_config.packet_time_us,
-            (unsigned long)s_hook_pkt_count,
-            (unsigned long)s_hook_seq_lost,
+            (unsigned long)rtp_st.packets_received,
+            (unsigned long)rtp_st.packets_lost,
+            (unsigned long)rtp_st.seq_errors,
             (long)rtp_st.jitter_us,
-            s_hook_pkt_count > 0 ? "true" : "false");
+            (unsigned long)rtp_st.ssrc,
+            (unsigned long)rtp_st.ssrc_mismatches,
+            (rtp_st.status_flags & AES67_RTP_STATUS_RECEIVING) ? "true" : "false");
         if (!ok) {
             jb_rollback(jb, mark);
             complete = false;
@@ -899,14 +898,16 @@ static int build_status_frame(struct aes67_webui *ctx, char *buf, size_t cap)
     jb_printf(&jb, ",\"controls\":");
     complete &= json_controls_array(&jb, ctx);
 
-    /* Ethernet hook stats (defined in the example's main.c for now) */
-    extern uint32_t s_hook_pkt_count;
-    extern uint32_t s_hook_seq_lost;
-    extern uint32_t s_hook_total_frames;
-    jb_printf(&jb, ",\"eth\":{\"rtp\":%lu,\"total\":%lu,\"lost\":%lu},\"truncated\":%s}",
-              (unsigned long)s_hook_pkt_count,
-              (unsigned long)s_hook_total_frames,
-              (unsigned long)s_hook_seq_lost,
+    /* Receive-path counters from the node */
+    aes67_node_rx_stats_t rx = {0};
+    aes67_node_get_rx_stats(ctx->node, &rx);
+    jb_printf(&jb, ",\"eth\":{\"frames\":%lu,\"forwarded\":%lu,\"ptp\":%lu,\"rtp\":%lu,"
+              "\"unmatched\":%lu,\"malformed\":%lu,\"ssrc_rejected\":%lu,\"overflow\":%lu},"
+              "\"truncated\":%s}",
+              (unsigned long)rx.frames_seen, (unsigned long)rx.frames_forwarded,
+              (unsigned long)rx.ptp_consumed, (unsigned long)rx.rtp_consumed,
+              (unsigned long)rx.rtp_unmatched, (unsigned long)rx.rtp_malformed,
+              (unsigned long)rx.ssrc_rejected, (unsigned long)rx.playout_overflow,
               complete ? "false" : "true");
 
     if (jb.overflow) {

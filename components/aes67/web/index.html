@@ -279,8 +279,9 @@ function onMsg(e){
   var eth=d.eth||{},now=Date.now();
   if(lT>0&&eth.rtp!=null){var dt=(now-lT)/1000;if(dt>0.1)g("fr").textContent=fmt(Math.round((eth.rtp-lRtp)/dt))}
   lRtp=eth.rtp||0;lT=now;
-  g("ft").textContent=fmt(eth.total);
-  g("fl").textContent=fmt(eth.lost);
+  g("ft").textContent=fmt(eth.frames);
+  var lost=0;(d.sinks||[]).forEach(function(s){lost+=s.packets_lost||0});
+  g("fl").textContent=fmt(lost);
 }
 
 var backoff=1000,olErr=false;
