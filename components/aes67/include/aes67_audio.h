@@ -129,6 +129,13 @@ void aes67_audio_get_staging_stats(aes67_audio_handle_t handle,
                                     uint32_t *isr_count, uint32_t *underruns);
 
 /**
+ * The playout stream buffer the DMA ISR plays from: two-slot interleaved
+ * int32 frames. Created by aes67_audio_init(); the node points the RTP
+ * engine's decoded output at it in I2S mode.
+ */
+StreamBufferHandle_t aes67_audio_get_playout_buf(aes67_audio_handle_t handle);
+
+/**
  * Initialize ISR-driven playback via slot ring. Must be called
  * BEFORE aes67_audio_start(). The DMA ISR reads from the slot ring
  * which is fed by aes67_audio_slot_write().

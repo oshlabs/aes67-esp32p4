@@ -184,6 +184,8 @@ static void playback_ring_to_dma(struct aes67_audio_ctx *ctx,
  * (one descriptor). A byte-stream buffer naturally handles variable
  * packet sizes by concatenating them until the ISR has a full descriptor. */
 static StreamBufferHandle_t s_isr_stream_buf = NULL;
+#define AES67_AUDIO_STREAM_BUF_BYTES 65536   /* ~170 ms of stereo int32 at 48 kHz */
+static StreamBufferHandle_t s_capture_stream_buf = NULL;
 
 /* ISR diagnostics */
 static volatile uint32_t s_isr_fires = 0;
@@ -282,22 +284,23 @@ void aes67_audio_log_isr_stats(void)
     }
 }
 
-/* Initialize stream buffer for ISR playback */
+StreamBufferHandle_t aes67_audio_get_playout_buf(aes67_audio_handle_t handle)
+{
+    (void)handle;
+    return s_isr_stream_buf;
+}
+
+/* Deprecated: the driver creates its playout buffer at init. */
 void aes67_audio_set_isr_stream_buf(aes67_audio_handle_t handle,
                                      StreamBufferHandle_t sbuf)
 {
     (void)handle;
     (void)sbuf;
-    if (!s_isr_stream_buf) {
-        s_isr_stream_buf = xStreamBufferCreate(65536, 1);
-    }
-    ESP_LOGI("aes67_audio", "ISR playback stream buffer: 64KB");
 }
 
 /* --- I2S RX Capture ISR (I2S -> AES67 TX source) --- */
 
-/* Capture stream buffer: RX DMA ISR writes here, TIC task reads */
-static StreamBufferHandle_t s_capture_stream_buf = NULL;
+/* Capture stream buffer: RX DMA ISR writes here, TIC task reads (declared above) */
 
 /* RX DMA ISR: fires when a DMA descriptor finishes capturing.
  * Copies captured int32 samples to the capture stream buffer.
@@ -324,14 +327,10 @@ StreamBufferHandle_t aes67_audio_get_capture_buf(aes67_audio_handle_t handle)
     return s_capture_stream_buf;
 }
 
-/* Initialize capture stream buffer for I2S RX -> RTP TX path */
+/* Deprecated: the driver creates its capture buffer at init. */
 void aes67_audio_init_capture(aes67_audio_handle_t handle)
 {
     (void)handle;
-    if (!s_capture_stream_buf) {
-        s_capture_stream_buf = xStreamBufferCreate(65536, 1);
-    }
-    ESP_LOGI("aes67_audio", "ISR capture stream buffer: 64KB");
 }
 
 /* Legacy staging ISR (unused, kept for reference) */
@@ -467,7 +466,21 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     /* When using ISR callback, auto_clear doesn't matter because the ISR
      * fills every descriptor (with data or silence). Set false for
      * i2s_channel_write compatibility in non-ISR modes. */
-    chan_cfg.auto_clear = (s_isr_stream_buf != NULL);
+    chan_cfg.auto_clear = true;
+
+    /* The DMA ISR plays from, and the capture ISR records into, two
+     * stream buffers the driver owns (single instance, file statics). */
+    if (!s_isr_stream_buf) {
+        s_isr_stream_buf = xStreamBufferCreate(AES67_AUDIO_STREAM_BUF_BYTES, 1);
+    }
+    if (!s_capture_stream_buf) {
+        s_capture_stream_buf = xStreamBufferCreate(AES67_AUDIO_STREAM_BUF_BYTES, 1);
+    }
+    if (!s_isr_stream_buf || !s_capture_stream_buf) {
+        ESP_LOGE(TAG, "Failed to create playout/capture stream buffers");
+        ret = ESP_ERR_NO_MEM;
+        goto err_free_bufs;
+    }
 
     ret = i2s_new_channel(&chan_cfg, &ctx->tx_chan, &ctx->rx_chan);
     if (ret != ESP_OK) {
