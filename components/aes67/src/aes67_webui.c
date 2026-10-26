@@ -111,6 +111,9 @@ static esp_err_t handler_index(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     httpd_resp_set_hdr(req, "Connection", "close");
+    /* The page and the status frame format change together with the
+     * firmware; a cached page reads new frames with old field names. */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
     httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
     return httpd_resp_send(req, (const char *)index_html_gz_start, len);
