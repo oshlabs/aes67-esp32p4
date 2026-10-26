@@ -36,8 +36,10 @@ An ESP-IDF component implementing the AES67 (and RAVENNA-compatible) audio-over-
   on receive for both PTP over Ethernet and PTP over UDP/IPv4 (the Ethernet input hook
   hands UDP PTP frames to the daemon with the driver's timestamp), and on transmit for
   delay requests on either transport
-  - Slave mode: synchronizes to an external PTP grandmaster
-  - Grandmaster mode: becomes PTP GM when no other master is present
+  - timeReceiver mode: synchronizes to an external PTP grandmaster
+  - Grandmaster mode: becomes the timeTransmitter when no other grandmaster is present
+  - Role names follow IEEE 1588g-2022 (timeTransmitter / timeReceiver, TT / TR); the
+    vendored daemon keeps the protocol's own field names
   - PI controller with adaptive gain for fast lock and stable tracking
 - **RTP audio streaming** with ISR-driven DMA playback
   - Source (TX) and Sink (RX) streams

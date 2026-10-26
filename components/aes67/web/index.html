@@ -24,6 +24,12 @@ header .meta{font-size:11px;color:#888;text-align:right}
 .dg{background:#4a4}.da{background:#e8a030}.dr{background:#c44}
 .lbl{color:#666;font-size:11px}
 .val{color:#ddd}
+/* Numbers that update twice a second get fixed-width slots so the lines do
+   not reflow as the digit count changes */
+.row .val,.fv{display:inline-block;text-align:right;font-variant-numeric:tabular-nums}
+#pg{min-width:23ch;text-align:left}#po,#pj{min-width:7ch}#py{min-width:8ch}#pf{min-width:6ch}
+#pl{display:inline-block;min-width:8ch}
+#fu{min-width:11ch}#fh{min-width:13ch}#fr{min-width:6ch}#ft{min-width:12ch}#fl{min-width:6ch}
 #rl .re{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #222}
 #rl .re:last-child{border:none}
 .btn{background:#e8a030;color:#111;border:none;padding:3px 10px;border-radius:3px;font:11px/1.4 inherit;cursor:pointer}
@@ -42,8 +48,8 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 #overlay .box .dot{width:10px;height:10px;margin:0 auto 10px}
 .ctl{display:flex;align-items:center;gap:10px;padding:4px 0}
 .ctl .lbl{width:140px}.ctl input[type=range]{flex:1;accent-color:#e8a030}.ctl .val{width:70px;text-align:right}
-.tag{font-size:9px;padding:1px 5px;border-radius:2px;margin-left:6px;vertical-align:middle;color:#111;font-weight:600}
-.tag-gm{background:#e8a030}.tag-slave{background:#4a4}
+.tag{font-size:11px;padding:1px 7px;border-radius:3px;margin-left:8px;vertical-align:middle;font-weight:600;border:1px solid;background:transparent;letter-spacing:.5px}
+.tag-gm{color:#e8a030;border-color:#e8a030}.tag-tr{color:#5c5;border-color:#5c5}
 @media(max-width:700px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -57,13 +63,12 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 <div class="card">
 <h2>PTP Status</h2>
 <div class="row">
-<span><span class="dot dr" id="pd"></span><span id="pl">--</span><span class="tag" id="pt" style="display:none"></span></span>
+<span><span class="dot dr" id="pd"></span><span id="pl">--</span><span class="tag" id="pt" style="display:none" title=""></span></span>
 <span><span class="lbl">GM </span><span class="val" id="pg">--</span></span>
 <span><span class="lbl">Offset </span><span class="val" id="po">--</span><span class="lbl"> ns</span></span>
 <span><span class="lbl">Jitter </span><span class="val" id="pj">--</span><span class="lbl"> ns</span></span>
 <span><span class="lbl">Drift </span><span class="val" id="pf">--</span><span class="lbl"> ppm</span></span>
 <span><span class="lbl">Delay </span><span class="val" id="py">--</span><span class="lbl"> ns</span></span>
-<span><span class="lbl">Transport </span><span class="val" id="px">--</span></span>
 </div>
 </div>
 <div class="card" id="ctlc" style="display:none"><h2>Controls</h2><div id="ctl"></div></div>
@@ -83,17 +88,17 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 </div>
 </div>
 <footer>
-<span>Uptime: <span id="fu">--</span></span>
-<span>Heap: <span id="fh">--</span></span>
-<span>RTP: <span id="fr">--</span> pps</span>
-<span>Pkts: <span id="ft">--</span></span>
-<span>Lost: <span id="fl">--</span></span>
+<span>Uptime: <span class="fv" id="fu">--</span></span>
+<span>Heap: <span class="fv" id="fh">--</span></span>
+<span>RTP: <span class="fv" id="fr">--</span> pps</span>
+<span>Pkts: <span class="fv" id="ft">--</span></span>
+<span>Lost: <span class="fv" id="fl">--</span></span>
 </footer>
 </div>
 <script>
 (function(){
 "use strict";
-var N=4,ws,rto,lRtp=0,lT=0;
+var N=4,ws,rto,lRtp=0,lT=0,lastUp=null;
 function g(id){return document.getElementById(id)}
 
 /* Every piece of markup is built with DOM calls and every string from the
@@ -253,18 +258,22 @@ function onMsg(e){
   g("pl").textContent=p.lock_state||"Unknown";
   g("pg").textContent=p.grandmaster||"--";
   var pt=g("pt");
-  if(p.is_gm){pt.textContent="GRANDMASTER";pt.className="tag tag-gm";pt.style.display=""}
-  else if(p.lock_state==="locked"){pt.textContent="SLAVE";pt.className="tag tag-slave";pt.style.display=""}
+  if(p.is_gm){pt.textContent="GM";pt.title="grandmaster (timeTransmitter)";pt.className="tag tag-gm";pt.style.display=""}
+  else if(p.lock_state==="locked"||p.lock_state==="locking"){
+    var tr=p.transport==="l2"?"L2":p.transport==="udp"?"UDP":"";
+    pt.textContent="TR"+(tr?" \u00b7 "+tr:"");pt.title="timeReceiver"+(tr?" via "+tr+(tr==="L2"?" (hardware timestamps)":""):"");
+    pt.className="tag tag-tr";pt.style.display=""}
   else{pt.style.display="none"}
   g("po").textContent=fmt(p.offset_ns);
   g("pj").textContent=fmt(p.jitter_ns);
   g("pf").textContent=p.drift_ppb!=null?(p.drift_ppb/1000).toFixed(2):"--";
   g("py").textContent=fmt(p.path_delay_ns);
-  g("px").textContent=p.is_gm?"grandmaster":(p.transport==="l2"?"L2 (hw stamps)":p.transport==="udp"?"UDP":"--");
   updateSlots("src",d.sources);
   updateSlots("sink",d.sinks);
   renderRemotes(d.sap_remotes);
   updateControls(d.controls);
+  if(lastUp!=null&&d.uptime!=null&&d.uptime<lastUp-1){location.reload();return}
+  lastUp=d.uptime;
   g("fu").textContent=fmtUp(d.uptime);
   g("fh").textContent=fmt(d.heap_free)+" B"+(d.truncated?" (status truncated)":"");
   var eth=d.eth||{},now=Date.now();

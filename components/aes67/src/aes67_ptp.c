@@ -265,7 +265,7 @@ static void ptp_monitor_task(void *arg)
         } else {
             if (ctx->is_grandmaster) {
                 ctx->is_grandmaster = false;
-                ESP_LOGI(TAG, "External grandmaster detected, switching to slave mode "
+                ESP_LOGI(TAG, "External grandmaster detected, switching to timeReceiver mode "
                          "(GM ID: %02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X)",
                          ctx->grandmaster_id[0], ctx->grandmaster_id[1],
                          ctx->grandmaster_id[2], ctx->grandmaster_id[3],
@@ -273,7 +273,7 @@ static void ptp_monitor_task(void *arg)
                          ctx->grandmaster_id[6], ctx->grandmaster_id[7]);
             }
 
-            /* Run lock state machine for slave mode */
+            /* Run lock state machine as timeReceiver */
             bool changed = ptp_update_lock_state(ctx, status.last_delta_ns);
             if (changed && ctx->lock_cb) {
                 ctx->lock_cb(ctx->lock_state, ctx->lock_cb_user_data);
@@ -285,7 +285,7 @@ static void ptp_monitor_task(void *arg)
         if (ctx->stats_counter >= 20) {
             ctx->stats_counter = 0;
 
-            const char *role = ctx->is_grandmaster ? "master" : "slave";
+            const char *role = ctx->is_grandmaster ? "timeTransmitter" : "timeReceiver";
             const char *lock = (ctx->lock_state == AES67_PTP_LOCKED) ? "locked" :
                                (ctx->lock_state == AES67_PTP_LOCKING) ? "locking" :
                                "unlocked";
