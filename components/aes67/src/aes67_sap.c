@@ -162,10 +162,20 @@ static void extract_session_name(const char *sdp, char *name, size_t name_len)
         end++;
     }
 
-    size_t len = (size_t)(end - s_line);
-    if (len >= name_len) len = name_len - 1;
-    memcpy(name, s_line, len);
-    name[len] = '\0';
+    /* Keep printable bytes only (control characters and DEL dropped),
+     * cap the length, and never leave the name empty. */
+    size_t n = 0;
+    for (const char *c = s_line; c < end && n < name_len - 1; c++) {
+        unsigned char u = (unsigned char)*c;
+        if (u >= 0x20 && u != 0x7F) {
+            name[n++] = *c;
+        }
+    }
+    name[n] = '\0';
+    if (n == 0) {
+        strncpy(name, "(unnamed)", name_len - 1);
+        name[name_len - 1] = '\0';
+    }
 }
 
 /* Handle a received SAP packet */

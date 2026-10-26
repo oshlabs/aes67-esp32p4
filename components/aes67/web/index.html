@@ -74,7 +74,7 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 <h2>Manual Subscribe</h2>
 <div class="ms">
 <textarea id="sdp" placeholder="Paste SDP text here&#10;v=0&#10;o=- ..."></textarea>
-<button class="btn" onclick="mSub()">Subscribe</button>
+<button class="btn" id="msub">Subscribe</button>
 </div>
 </div>
 <footer>
@@ -87,8 +87,15 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 </div>
 <script>
 (function(){
+"use strict";
 var N=4,ws,rto,lRtp=0,lT=0;
 function g(id){return document.getElementById(id)}
+
+/* Every piece of markup is built with DOM calls and every string from the
+   device lands in textContent. Nothing from the network is parsed as HTML
+   or as script, whatever a session name contains. */
+function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
+function btn(text,cls,onclick){var b=el("button","btn"+(cls?" "+cls:""),text);b.addEventListener("click",onclick);return b}
 
 function fmt(n){return n!=null?Number(n).toLocaleString():"--"}
 function fmtUp(s){
@@ -96,108 +103,104 @@ function fmtUp(s){
   var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),r=s%60,p=[];
   if(d)p.push(d+"d");p.push(h+"h");p.push(m+"m");p.push(r+"s");return p.join(" ");
 }
-function esc(s){return s?String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"):""}
 function dc(l){return l==="locked"?"dg":l==="locking"||l==="acquiring"?"da":"dr"}
 function fmtTime(us){
   if(!us)return"0";
   if(us>=1000000)return(us/1000000).toFixed(1)+"s";
   if(us>=1000){var ms=us/1000;return(ms%1?ms.toFixed(3).replace(/0+$/,''):ms.toFixed(0))+"ms"}
-  return us+"\u00b5s";
+  return us+"µs";
 }
 function fc(s){return(s.codec||"?")+" / "+(s.sample_rate?fmt(s.sample_rate)+"Hz":"?")+" / "+(s.channels||"?")+"ch / "+fmtTime(s.ptime_us)}
 
-/* Build all slot DOM once at init. Source slots and sink slots share structure
-   but sinks get edit panel + delete button. IDs follow the spec:
-   src-0-name, src-0-codec, src-0-tx, sink-0-name, sink-0-rx, sink-0-lost, etc. */
-function mkSlots(container,prefix,isSink){
-  var none=document.createElement("span");
-  none.className="lbl";none.id=prefix+"-none";
-  none.textContent=isSink?"No active sinks":"No active sources";
-  container.appendChild(none);
-  for(var i=0;i<N;i++){
-    var d=document.createElement("div");
-    d.className="st";d.id=prefix+"-slot-"+i;d.setAttribute("data-stream-id",String(i));
-    var hdr='<div class="hdr"><span class="sn"><span class="dot dr" id="'+prefix+"-"+i+'-dot"></span><span id="'+prefix+"-"+i+'-name">--</span></span><span>';
-    if(isSink){
-      hdr+='<button class="btn" style="font-size:10px;padding:1px 6px;margin-right:4px" onclick="TE(\''+prefix+"',"+i+')">edit</button>';
-      hdr+='<button class="btn bd" style="font-size:10px;padding:1px 6px" onclick="dS('+i+')">x</button>';
-    }else{
-      hdr+='<button class="btn" style="font-size:10px;padding:1px 6px" onclick="TE(\''+prefix+"',"+i+')">info</button>';
-    }
-    hdr+='</span></div>';
-    hdr+='<div class="si" id="'+prefix+"-"+i+'-codec">--</div>';
-    if(isSink){
-      hdr+='<div class="si">RX: <span id="sink-'+i+'-rx">--</span> pkts | Lost: <span id="sink-'+i+'-lost">--</span> | Jitter: <span id="sink-'+i+'-jitter">--</span> us</div>';
-      hdr+='<div class="ep" id="edit-sink-'+i+'"><div class="lbl">Name:</div><input id="edit-sink-name-'+i+'" value=""><div class="lbl">SDP (paste to re-subscribe):</div><textarea id="edit-sink-sdp-'+i+'" placeholder="Paste SDP..."></textarea><button class="btn" onclick="rS('+i+')">Re-subscribe</button></div>';
-    }else{
-      hdr+='<div class="si">TX: <span id="src-'+i+'-tx">--</span> pkts</div>';
-      hdr+='<div class="ep" id="edit-src-'+i+'"><div class="lbl">Source ID: '+i+'</div></div>';
-    }
-    d.innerHTML=hdr;
-    container.appendChild(d);
-  }
+function api(method,path,body){
+  var o={method:method,headers:{}};
+  if(body!==undefined){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(body)}
+  return fetch(path,o);
 }
+function toggle(e){e.style.display=(!e.style.display||e.style.display==="none")?"block":"none"}
 
-/* Init after DOM ready (gzip delivery may race with parser) */
-function init(){
-  mkSlots(g("sc"),"src",false);
-  mkSlots(g("sk"),"sink",true);
-  fetch("/api/info").then(function(r){return r.json()}).then(function(d){
-    if(d.name)g("devname").textContent=d.name;
-    if(d.version)g("ver").textContent="v"+d.version;
-    if(d.ip)g("ip").textContent=d.ip;
-  }).catch(function(){});
-  wsConn();
+/* Stream slots are built once; status frames only update their text. */
+var slots={src:[],sink:[]};
+function mkSlots(container,prefix,isSink){
+  var none=el("span","lbl",isSink?"No active sinks":"No active sources");
+  none.id=prefix+"-none";container.appendChild(none);
+  for(var i=0;i<N;i++)(function(i){
+    var d=el("div","st"),hdr=el("div","hdr"),sn=el("span","sn"),dot=el("span","dot dr"),name=el("span",null,"--"),right=el("span");
+    sn.appendChild(dot);sn.appendChild(name);hdr.appendChild(sn);hdr.appendChild(right);d.appendChild(hdr);
+    var codec=el("div","si","--");d.appendChild(codec);
+    var s={box:d,dot:dot,name:name,codec:codec};
+    if(isSink){
+      var stats=el("div","si");
+      var rx=el("span",null,"--"),lost=el("span",null,"--"),jit=el("span",null,"--");
+      stats.appendChild(document.createTextNode("RX: "));stats.appendChild(rx);
+      stats.appendChild(document.createTextNode(" pkts | Lost: "));stats.appendChild(lost);
+      stats.appendChild(document.createTextNode(" | Jitter: "));stats.appendChild(jit);
+      stats.appendChild(document.createTextNode(" us"));d.appendChild(stats);
+      var ep=el("div","ep"),nameIn=el("input"),sdpIn=el("textarea");
+      sdpIn.placeholder="Paste SDP...";
+      ep.appendChild(el("div","lbl","Name:"));ep.appendChild(nameIn);
+      ep.appendChild(el("div","lbl","SDP (paste to re-subscribe):"));ep.appendChild(sdpIn);
+      ep.appendChild(btn("Re-subscribe",null,function(){
+        if(!sdpIn.value.trim()){showOl("Paste SDP text to re-subscribe",true);return}
+        api("DELETE","/api/sinks/"+i).then(function(){return api("POST","/api/sinks",{name:nameIn.value||"Sink",sdp:sdpIn.value})});
+      }));
+      d.appendChild(ep);
+      var eb=btn("edit",null,function(){toggle(ep)});eb.style.cssText="font-size:10px;padding:1px 6px;margin-right:4px";
+      var xb=btn("x","bd",function(){api("DELETE","/api/sinks/"+i)});xb.style.cssText="font-size:10px;padding:1px 6px";
+      right.appendChild(eb);right.appendChild(xb);
+      s.rx=rx;s.lost=lost;s.jit=jit;s.ep=ep;s.nameIn=nameIn;
+    }else{
+      var tx=el("div","si");var txv=el("span",null,"--");
+      tx.appendChild(document.createTextNode("TX: "));tx.appendChild(txv);tx.appendChild(document.createTextNode(" pkts"));d.appendChild(tx);
+      var ip=el("div","ep");ip.appendChild(el("div","lbl","Source ID: "+i));d.appendChild(ip);
+      var ib=btn("info",null,function(){toggle(ip)});ib.style.cssText="font-size:10px;padding:1px 6px";right.appendChild(ib);
+      s.tx=txv;s.ep=ip;
+    }
+    container.appendChild(d);slots[prefix].push(s);
+  })(i);
 }
-if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init);
-else init();
 
 function updateSlots(prefix,arr){
-  var ids={},i;
+  var ids={},i,any=false;
   if(arr)for(i=0;i<arr.length;i++)ids[arr[i].id]=arr[i];
-  var any=false;
   for(i=0;i<N;i++){
-    var slot=g(prefix+"-slot-"+i),data=ids[i];
+    var s=slots[prefix][i],data=ids[i];
     if(data){
-      any=true;
-      slot.style.display="block";
+      any=true;s.box.style.display="block";
       var on=prefix==="src"?true:data.receiving;
-      g(prefix+"-"+i+"-dot").className="dot "+(on?"dg":"dr");
-      g(prefix+"-"+i+"-name").textContent=data.name||"--";
-      g(prefix+"-"+i+"-codec").textContent=fc(data);
-      if(prefix==="src"){
-        g("src-"+i+"-tx").textContent=fmt(data.packets_sent);
-      }else{
-        g("sink-"+i+"-rx").textContent=fmt(data.packets_received);
-        g("sink-"+i+"-lost").textContent=fmt(data.packets_lost);
-        g("sink-"+i+"-jitter").textContent=fmt(data.jitter_us);
-        var ni=g("edit-sink-name-"+i);
-        if(ni&&document.activeElement!==ni)ni.value=data.name||"";
+      s.dot.className="dot "+(on?"dg":"dr");
+      s.name.textContent=data.name||"--";
+      s.codec.textContent=fc(data);
+      if(prefix==="src"){s.tx.textContent=fmt(data.packets_sent)}
+      else{
+        s.rx.textContent=fmt(data.packets_received);s.lost.textContent=fmt(data.packets_lost);s.jit.textContent=fmt(data.jitter_us);
+        if(document.activeElement!==s.nameIn)s.nameIn.value=data.name||"";
       }
-    }else{
-      slot.style.display="none";
-      var ep=g("edit-"+prefix+"-"+i);
-      if(ep)ep.style.display="none";
-    }
+    }else{s.box.style.display="none";s.ep.style.display="none"}
   }
   g(prefix+"-none").style.display=any?"none":"";
 }
 
 function renderRemotes(arr){
   var c=g("rl");
-  if(!arr||!arr.length){c.innerHTML='<span class="lbl">No remote sources discovered</span>';return}
-  var h="";
-  for(var i=0;i<arr.length;i++){
-    var r=arr[i];
-    var info=r.codec?(esc(r.codec)+' / '+fmt(r.sample_rate)+'Hz / '+r.channels+'ch / '+fmtTime(r.ptime_us)):'';
-    h+='<div class="re"><span>'+esc(r.name)+' <span class="lbl">('+esc(r.origin)+')</span>'+(info?' <span class="lbl">'+info+'</span>':'')+'</span><button class="btn" onclick="sR(\''+esc(r.origin)+"','"+esc(r.name)+'\')">Subscribe</button></div>';
-  }
-  c.innerHTML=h;
+  while(c.firstChild)c.removeChild(c.firstChild);
+  if(!arr||!arr.length){c.appendChild(el("span","lbl","No remote sources discovered"));return}
+  arr.forEach(function(r){
+    var row=el("div","re"),left=el("span");
+    left.appendChild(document.createTextNode(r.name+" "));
+    left.appendChild(el("span","lbl","("+r.origin+")"));
+    if(r.codec){left.appendChild(document.createTextNode(" "));left.appendChild(el("span","lbl",fc(r)))}
+    row.appendChild(left);
+    row.appendChild(btn("Subscribe",null,function(){api("POST","/api/sinks",{name:r.name,origin:r.origin})}));
+    c.appendChild(row);
+  });
 }
 
 function onMsg(e){
-  var d;try{d=JSON.parse(e.data)}catch(x){return}
+  var d;
+  try{d=JSON.parse(e.data)}catch(x){showOl("Bad status frame from device",true);return}
   if(d.t!=="status")return;
+  hideOl();
   var p=d.ptp||{};
   g("pd").className="dot "+dc(p.lock_state);
   g("pl").textContent=p.lock_state||"Unknown";
@@ -213,7 +216,7 @@ function onMsg(e){
   updateSlots("sink",d.sinks);
   renderRemotes(d.sap_remotes);
   g("fu").textContent=fmtUp(d.uptime);
-  g("fh").textContent=fmt(d.heap_free)+" B";
+  g("fh").textContent=fmt(d.heap_free)+" B"+(d.truncated?" (status truncated)":"");
   var eth=d.eth||{},now=Date.now();
   if(lT>0&&eth.rtp!=null){var dt=(now-lT)/1000;if(dt>0.1)g("fr").textContent=fmt(Math.round((eth.rtp-lRtp)/dt))}
   lRtp=eth.rtp||0;lT=now;
@@ -221,15 +224,15 @@ function onMsg(e){
   g("fl").textContent=fmt(eth.lost);
 }
 
-var backoff=1000;
-function showOl(msg){var o=g("overlay");o.classList.add("show");g("ol-msg").textContent=msg}
-function hideOl(){g("overlay").classList.remove("show")}
+var backoff=1000,olErr=false;
+function showOl(msg,isErr){var o=g("overlay");o.classList.add("show");g("ol-msg").textContent=msg;olErr=!!isErr}
+function hideOl(){g("overlay").classList.remove("show");olErr=false}
 
 function wsConn(){
   showOl("Connecting...");
   var l=location;
   ws=new WebSocket((l.protocol==="https:"?"wss://":"ws://")+l.host+"/ws");
-  ws.onopen=function(){backoff=1000;hideOl()};
+  ws.onopen=function(){backoff=1000;showOl("Waiting for status...")};
   ws.onmessage=onMsg;
   ws.onclose=function(){
     var sec=Math.round(backoff/1000);
@@ -240,22 +243,23 @@ function wsConn(){
   ws.onerror=function(){ws.close()};
 }
 
-/* Globals for onclick handlers */
-window.TE=function(t,id){var e=g("edit-"+t+"-"+id);if(e)e.style.display=(!e.style.display||e.style.display==="none")?"block":"none"};
-window.rS=function(id){
-  var n=g("edit-sink-name-"+id),s=g("edit-sink-sdp-"+id);
-  if(!s||!s.value.trim()){alert("Paste SDP text to re-subscribe");return}
-  fetch("/api/sinks/"+id,{method:"DELETE"}).then(function(){
-    return fetch("/api/sinks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:n?n.value:"Sink",sdp:s.value})});
+function init(){
+  mkSlots(g("sc"),"src",false);
+  mkSlots(g("sk"),"sink",true);
+  g("msub").addEventListener("click",function(){
+    var v=g("sdp").value.trim();if(!v)return;
+    api("POST","/api/sinks",{name:"Manual",sdp:v}).then(function(r){if(r.ok)g("sdp").value=""});
   });
-};
-window.sR=function(o,n){fetch("/api/sinks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:n,origin:o})})};
-window.dS=function(id){fetch("/api/sinks/"+id,{method:"DELETE"})};
-window.mSub=function(){
-  var v=g("sdp").value.trim();if(!v)return;
-  fetch("/api/sinks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:"Manual",sdp:v})}).then(function(r){if(r.ok)g("sdp").value=""});
-};
-
+  g("overlay").addEventListener("click",function(){if(olErr)hideOl()});
+  fetch("/api/info").then(function(r){return r.json()}).then(function(d){
+    if(d.name)g("devname").textContent=d.name;
+    if(d.version)g("ver").textContent="v"+d.version;
+    if(d.ip)g("ip").textContent=d.ip;
+  }).catch(function(){});
+  wsConn();
+}
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init);
+else init();
 })();
 </script>
 </body>

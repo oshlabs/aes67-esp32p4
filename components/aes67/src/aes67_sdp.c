@@ -410,3 +410,17 @@ esp_err_t aes67_sdp_parse(const char *sdp_text, aes67_sdp_t *sdp)
 
     return ESP_OK;
 }
+
+bool aes67_name_is_clean(const char *name)
+{
+    if (!name || !name[0]) {
+        return false;
+    }
+    size_t n = 0;
+    for (const unsigned char *c = (const unsigned char *)name; *c; c++, n++) {
+        if (*c < 0x20 || *c == 0x7F || n >= 63) {
+            return false;
+        }
+    }
+    return true;
+}

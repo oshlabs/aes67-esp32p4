@@ -104,6 +104,8 @@ static esp_err_t handler_index(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
     return httpd_resp_send(req, (const char *)index_html_gz_start, len);
 }
 
@@ -170,6 +172,31 @@ static void jb_rollback(jbuf_t *jb, size_t mark)
     jb->overflow = false;
 }
 
+/* Append s as a JSON string literal with quotes, escaping '"', '\\' and
+ * control characters. Bytes >= 0x80 pass through (UTF-8 is assumed). */
+static bool jb_quoted(jbuf_t *jb, const char *s)
+{
+    if (!jb_printf(jb, "\"")) return false;
+    for (const unsigned char *c = (const unsigned char *)s; *c; c++) {
+        bool ok;
+        switch (*c) {
+        case '"':  ok = jb_printf(jb, "\\\""); break;
+        case '\\': ok = jb_printf(jb, "\\\\"); break;
+        case '\n': ok = jb_printf(jb, "\\n"); break;
+        case '\r': ok = jb_printf(jb, "\\r"); break;
+        case '\t': ok = jb_printf(jb, "\\t"); break;
+        default:
+            if (*c < 0x20 || *c == 0x7F) {
+                ok = jb_printf(jb, "\\u%04x", *c);
+            } else {
+                ok = jb_printf(jb, "%c", *c);
+            }
+        }
+        if (!ok) return false;
+    }
+    return jb_printf(jb, "\"");
+}
+
 /* ---- JSON fragments shared by REST and the WebSocket frame ---- */
 
 static void json_ptp_object(jbuf_t *jb, const aes67_ptp_status_t *st)
@@ -205,12 +232,13 @@ static void json_info_object(jbuf_t *jb, struct aes67_webui *ctx)
     char ip_str[16];
     aes67_net_u32_to_ip(ip_u32, ip_str, sizeof(ip_str));
 
+    jb_printf(jb, "{\"name\":");
+    jb_quoted(jb, cfg.node_name);
     jb_printf(jb,
-        "{\"name\":\"%s\",\"version\":\"%d.%d.%d\",\"ip\":\"%s\","
+        ",\"version\":\"%d.%d.%d\",\"ip\":\"%s\","
         "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\","
         "\"uptime\":%lu,\"heap_free\":%lu,\"heap_min\":%lu,"
         "\"sample_rate\":%lu,\"channels\":%u,\"codec\":\"%s\",\"ptime_us\":%u}",
-        cfg.node_name,
         AES67_VERSION_MAJOR, AES67_VERSION_MINOR, AES67_VERSION_PATCH,
         ip_str,
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
@@ -243,11 +271,12 @@ static bool json_sources_array(jbuf_t *jb, struct aes67_webui *ctx)
             aes67_rtp_stream_get_status(src->rtp_stream, &rtp_st);
         }
         size_t mark = jb_mark(jb);
-        bool ok = jb_printf(jb,
-            "%s{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"sample_rate\":%lu,"
+        bool ok = jb_printf(jb, "%s{\"id\":%u,\"name\":", first ? "" : ",", src->id)
+               && jb_quoted(jb, src->name)
+               && jb_printf(jb,
+            ",\"codec\":\"%s\",\"sample_rate\":%lu,"
             "\"channels\":%u,\"ptime_us\":%u,\"packets_sent\":%lu}",
-            first ? "" : ",",
-            src->id, src->name, codec_name(src->rtp_config.codec),
+            codec_name(src->rtp_config.codec),
             (unsigned long)src->rtp_config.sample_rate,
             src->rtp_config.channels,
             src->rtp_config.packet_time_us,
@@ -286,12 +315,13 @@ static bool json_sinks_array(jbuf_t *jb, struct aes67_webui *ctx)
         extern uint32_t s_hook_pkt_count;
         extern uint32_t s_hook_seq_lost;
         size_t mark = jb_mark(jb);
-        bool ok = jb_printf(jb,
-            "%s{\"id\":%u,\"name\":\"%s\",\"codec\":\"%s\",\"sample_rate\":%lu,"
+        bool ok = jb_printf(jb, "%s{\"id\":%u,\"name\":", first ? "" : ",", sink->id)
+               && jb_quoted(jb, sink->name)
+               && jb_printf(jb,
+            ",\"codec\":\"%s\",\"sample_rate\":%lu,"
             "\"channels\":%u,\"ptime_us\":%u,\"packets_received\":%lu,"
             "\"packets_lost\":%lu,\"jitter_us\":%ld,\"receiving\":%s}",
-            first ? "" : ",",
-            sink->id, sink->name, codec_name(sink->rtp_config.codec),
+            codec_name(sink->rtp_config.codec),
             (unsigned long)sink->rtp_config.sample_rate,
             sink->rtp_config.channels,
             sink->rtp_config.packet_time_us,
@@ -338,11 +368,12 @@ static bool json_remotes_array(jbuf_t *jb, struct aes67_webui *ctx)
             ptime = sdp->ptime_us;
         }
         size_t mark = jb_mark(jb);
-        bool ok = jb_printf(jb,
-            "%s{\"name\":\"%s\",\"origin\":\"%s\",\"msg_id\":%u,"
+        bool ok = jb_printf(jb, "%s{\"name\":", first ? "" : ",")
+               && jb_quoted(jb, remote->name)
+               && jb_printf(jb,
+            ",\"origin\":\"%s\",\"msg_id\":%u,"
             "\"codec\":\"%s\",\"sample_rate\":%lu,\"channels\":%u,\"ptime_us\":%u}",
-            first ? "" : ",",
-            remote->name, origin_str, remote->msg_id,
+            origin_str, remote->msg_id,
             codec_str, (unsigned long)rate, ch, ptime);
         if (!ok) {
             jb_rollback(jb, mark);
@@ -364,6 +395,8 @@ static esp_err_t send_json(httpd_req_t *req, const jbuf_t *jb)
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
     return httpd_resp_send(req, jb->buf, jb->len);
 }
 
@@ -508,6 +541,13 @@ static esp_err_t handler_post_sink(httpd_req_t *req)
     }
 
     free(body);
+
+    if (!aes67_name_is_clean(name)) {
+        free(sdp);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "name must be 1-63 printable characters");
+        return ESP_FAIL;
+    }
 
     /* If no SDP provided, try to find it from SAP remotes by name */
     if (!sdp || !sdp[0]) {
