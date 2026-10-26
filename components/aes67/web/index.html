@@ -112,10 +112,23 @@ function fmtTime(us){
 }
 function fc(s){return(s.codec||"?")+" / "+(s.sample_rate?fmt(s.sample_rate)+"Hz":"?")+" / "+(s.channels||"?")+"ch / "+fmtTime(s.ptime_us)}
 
+/* State-changing calls carry a custom header (a CSRF guard: browsers do not
+   send it cross-origin) and, when the device demands one, a bearer token
+   asked for once and kept for this browser session. */
+var token=null;
+try{token=sessionStorage.getItem("aes67_token")}catch(x){}
 function api(method,path,body){
-  var o={method:method,headers:{}};
+  var o={method:method,headers:{"X-AES67-Request":"1"}};
   if(body!==undefined){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(body)}
-  return fetch(path,o);
+  if(token)o.headers["Authorization"]="Bearer "+token;
+  return fetch(path,o).then(function(r){
+    if(r.status===401){
+      var t=prompt("This node requires a control token");
+      if(t){token=t;try{sessionStorage.setItem("aes67_token",t)}catch(x){}return api(method,path,body)}
+    }
+    if(!r.ok)r.text().then(function(m){showOl(method+" "+path+" failed: "+m,true)});
+    return r;
+  });
 }
 function toggle(e){e.style.display=(!e.style.display||e.style.display==="none")?"block":"none"}
 

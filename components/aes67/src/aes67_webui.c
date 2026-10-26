@@ -36,6 +36,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
+#include "cJSON.h"
 
 static const char *TAG = "aes67_webui";
 
@@ -69,7 +70,11 @@ struct aes67_webui {
     char                   *json;         /* status frame build buffer */
     uint16_t                port;
     bool                    running;
+    int                     bucket;         /* mutation rate limit */
+    int64_t                 bucket_last_us;
 };
+
+static bool token_required(void);
 
 /* ---- Codec name helper ---- */
 
@@ -238,7 +243,8 @@ static void json_info_object(jbuf_t *jb, struct aes67_webui *ctx)
         ",\"version\":\"%d.%d.%d\",\"ip\":\"%s\","
         "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\","
         "\"uptime\":%lu,\"heap_free\":%lu,\"heap_min\":%lu,"
-        "\"sample_rate\":%lu,\"channels\":%u,\"codec\":\"%s\",\"ptime_us\":%u}",
+        "\"sample_rate\":%lu,\"channels\":%u,\"codec\":\"%s\",\"ptime_us\":%u,"
+        "\"auth_required\":%s}",
         AES67_VERSION_MAJOR, AES67_VERSION_MINOR, AES67_VERSION_PATCH,
         ip_str,
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
@@ -248,7 +254,8 @@ static void json_info_object(jbuf_t *jb, struct aes67_webui *ctx)
         (unsigned long)cfg.audio.sample_rate,
         cfg.audio.channels,
         codec_name(cfg.audio.codec),
-        cfg.audio.packet_time_us);
+        cfg.audio.packet_time_us,
+        token_required() ? "true" : "false");
 }
 
 /* Append "[entry,entry,...]" of the enabled sources. Returns false if the
@@ -457,125 +464,190 @@ static esp_err_t handler_api_sap_remotes(httpd_req_t *req)
     return send_json(req, &jb);
 }
 
+/* ---- Access control for state-changing requests ----
+ *
+ * Three cheap layers for a device on a trusted audio LAN:
+ *  - a custom request header: browsers do not send one cross-origin
+ *    without a CORS preflight, which closes the CSRF route;
+ *  - an optional bearer token from Kconfig;
+ *  - a rate limit, and a log line with the client address.
+ * See README "Security model". */
+
+#define MUTATION_BURST   5          /* calls allowed in a burst */
+#define MUTATION_REFILL_US 1000000  /* one new call per second */
+
+static void client_addr(httpd_req_t *req, char *out, size_t cap)
+{
+    struct sockaddr_storage addr;
+    socklen_t len = sizeof(addr);
+    int fd = httpd_req_to_sockfd(req);
+    out[0] = '\0';
+    if (fd >= 0 && getpeername(fd, (struct sockaddr *)&addr, &len) == 0 &&
+        addr.ss_family == AF_INET) {
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr, out, cap);
+    }
+}
+
+static bool token_required(void)
+{
+    return CONFIG_AES67_WEBUI_TOKEN[0] != '\0';
+}
+
+/* Returns ESP_OK if the request may change state; otherwise the error
+ * response has been sent. */
+static esp_err_t authorize_mutation(httpd_req_t *req)
+{
+    struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
+    char peer[48];
+    client_addr(req, peer, sizeof(peer));
+
+    char hdr[8] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-AES67-Request", hdr, sizeof(hdr)) != ESP_OK) {
+        ESP_LOGW(TAG, "%s %s from %s refused: missing X-AES67-Request header",
+                 req->method == HTTP_DELETE ? "DELETE" : "POST", req->uri, peer);
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "X-AES67-Request header required");
+        return ESP_FAIL;
+    }
+
+    if (token_required()) {
+        char auth[96] = {0};
+        const char *want = CONFIG_AES67_WEBUI_TOKEN;
+        bool ok = httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK
+               && strncmp(auth, "Bearer ", 7) == 0
+               && strlen(auth + 7) == strlen(want);
+        if (ok) {
+            /* constant-time compare */
+            unsigned diff = 0;
+            for (size_t i = 0; want[i]; i++) diff |= (unsigned)(auth[7 + i] ^ want[i]);
+            ok = diff == 0;
+        }
+        if (!ok) {
+            ESP_LOGW(TAG, "%s %s from %s refused: bad or missing token",
+                     req->method == HTTP_DELETE ? "DELETE" : "POST", req->uri, peer);
+            httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+            httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token required");
+            return ESP_FAIL;
+        }
+    }
+
+    /* Token bucket shared by all mutating endpoints */
+    int64_t now = esp_timer_get_time();
+    int64_t refill = (now - ctx->bucket_last_us) / MUTATION_REFILL_US;
+    if (refill > 0) {
+        ctx->bucket = (ctx->bucket + refill > MUTATION_BURST) ? MUTATION_BURST : ctx->bucket + refill;
+        ctx->bucket_last_us = now;
+    }
+    if (ctx->bucket <= 0) {
+        ESP_LOGW(TAG, "%s %s from %s refused: rate limit", 
+                 req->method == HTTP_DELETE ? "DELETE" : "POST", req->uri, peer);
+        httpd_resp_set_status(req, "429 Too Many Requests");
+        httpd_resp_set_hdr(req, "Retry-After", "1");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_send(req, "slow down", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+    ctx->bucket--;
+
+    ESP_LOGI(TAG, "%s %s from %s", req->method == HTTP_DELETE ? "DELETE" : "POST", req->uri, peer);
+    return ESP_OK;
+}
+
+/* SDP text: printable plus CR, LF, TAB; bounded. */
+static bool sdp_is_clean(const char *sdp, size_t max_len)
+{
+    size_t n = 0;
+    for (const unsigned char *c = (const unsigned char *)sdp; *c; c++, n++) {
+        if (n >= max_len) return false;
+        if ((*c < 0x20 && *c != '\r' && *c != '\n' && *c != '\t') || *c == 0x7F) return false;
+    }
+    return n > 0;
+}
+
 /* ---- POST /api/sinks : subscribe to remote source ---- */
 
 static esp_err_t handler_post_sink(httpd_req_t *req)
 {
     struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
 
-    /* Read request body (max 2KB for SDP) */
+    if (authorize_mutation(req) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /* Body: {"name":"...","sdp":"v=0\r\n..."} or {"name":"...","origin":"a.b.c.d"}
+     * (the latter resolves the SDP from the SAP table by name). */
     int content_len = req->content_len;
     if (content_len <= 0 || content_len > JSON_BUF_SIZE) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body length");
         return ESP_FAIL;
     }
-
     char *body = malloc(content_len + 1);
     if (!body) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-
-    int received = httpd_req_recv(req, body, content_len);
-    if (received != content_len) {
-        free(body);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete body");
-        return ESP_FAIL;
+    int received = 0;
+    while (received < content_len) {
+        int r = httpd_req_recv(req, body + received, content_len - received);
+        if (r <= 0) {
+            free(body);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete body");
+            return ESP_FAIL;
+        }
+        received += r;
     }
     body[content_len] = '\0';
 
-    /*
-     * Minimal JSON parsing: extract "name" and "sdp" fields.
-     * Expected format: {"name":"...","sdp":"v=0\r\n..."}
-     */
-    const char *name_key = "\"name\":\"";
-    const char *sdp_key = "\"sdp\":\"";
-
-    char name[64] = {0};
-    char *sdp = NULL;
-
-    /* Extract name */
-    char *p = strstr(body, name_key);
-    if (p) {
-        p += strlen(name_key);
-        char *end = strchr(p, '"');
-        if (end) {
-            size_t nlen = end - p;
-            if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
-            memcpy(name, p, nlen);
-            name[nlen] = '\0';
-        }
-    }
-
-    /* Extract SDP */
-    p = strstr(body, sdp_key);
-    if (p) {
-        p += strlen(sdp_key);
-        /* Find the closing quote (skip escaped quotes) */
-        char *end = p;
-        while (*end && !(*end == '"' && *(end - 1) != '\\')) {
-            end++;
-        }
-        if (*end == '"') {
-            size_t slen = end - p;
-            sdp = malloc(slen + 1);
-            if (sdp) {
-                memcpy(sdp, p, slen);
-                sdp[slen] = '\0';
-                /* Unescape \r\n sequences */
-                char *r = sdp, *w = sdp;
-                while (*r) {
-                    if (r[0] == '\\' && r[1] == 'r') {
-                        *w++ = '\r';
-                        r += 2;
-                    } else if (r[0] == '\\' && r[1] == 'n') {
-                        *w++ = '\n';
-                        r += 2;
-                    } else {
-                        *w++ = *r++;
-                    }
-                }
-                *w = '\0';
-            }
-        }
-    }
-
+    cJSON *root = cJSON_ParseWithLength(body, content_len);
     free(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body is not valid JSON");
+        return ESP_FAIL;
+    }
 
-    if (!aes67_name_is_clean(name)) {
-        free(sdp);
+    const cJSON *jname = cJSON_GetObjectItemCaseSensitive(root, "name");
+    const cJSON *jsdp = cJSON_GetObjectItemCaseSensitive(root, "sdp");
+    if (!cJSON_IsString(jname) || !aes67_name_is_clean(jname->valuestring)) {
+        cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                             "name must be 1-63 printable characters");
         return ESP_FAIL;
     }
+    char name[64];
+    strlcpy(name, jname->valuestring, sizeof(name));
 
-    /* If no SDP provided, try to find it from SAP remotes by name */
-    if (!sdp || !sdp[0]) {
-        free(sdp);
-        sdp = NULL;
+    char *sdp = NULL;
+    if (cJSON_IsString(jsdp) && jsdp->valuestring[0]) {
+        if (!sdp_is_clean(jsdp->valuestring, AES67_SDP_MAX_LEN - 1)) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "sdp must be printable text under the size limit");
+            return ESP_FAIL;
+        }
+        sdp = strdup(jsdp->valuestring);
+    }
+    cJSON_Delete(root);
+
+    /* No SDP given: look the name up in the SAP table */
+    if (!sdp) {
         aes67_sap_handle_t sap = NULL;
         aes67_node_get_sap(ctx->node, &sap);
-        if (sap && name[0]) {
-            int rc = aes67_sap_get_remote_count(sap);
-            for (int i = 0; i < rc; i++) {
-                aes67_sap_remote_source_t remote;
-                if (aes67_sap_get_remote(sap, i, &remote) == ESP_OK &&
-                    strcmp(remote.name, name) == 0) {
-                    sdp = strdup(remote.sdp);
-                    break;
-                }
+        aes67_sap_remote_source_t *remote = &ctx->scratch->remote;
+        int rc = sap ? aes67_sap_get_remote_count(sap) : 0;
+        for (int i = 0; i < rc; i++) {
+            if (aes67_sap_get_remote(sap, i, remote) == ESP_OK &&
+                strcmp(remote->name, name) == 0) {
+                sdp = strdup(remote->sdp);
+                break;
             }
         }
     }
-
-    if (!name[0] || !sdp || !sdp[0]) {
+    if (!sdp || !sdp[0]) {
         free(sdp);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "Missing 'name' or 'sdp' field, and name not found in SAP");
+                            "Missing 'sdp', and 'name' not found in the SAP table");
         return ESP_FAIL;
     }
 
-    /* Add the sink via session manager */
     aes67_session_handle_t sess = NULL;
     aes67_node_get_session(ctx->node, &sess);
     if (!sess) {
@@ -587,20 +659,16 @@ static esp_err_t handler_post_sink(httpd_req_t *req)
     uint8_t id = 0;
     esp_err_t ret = aes67_session_add_sink(sess, name, sdp, &id);
     free(sdp);
-
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "add_sink failed: %s", esp_err_to_name(ret));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "Failed to add sink");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to add sink");
         return ESP_FAIL;
     }
 
-    /* Respond with the assigned ID */
     char resp[32];
     int len = snprintf(resp, sizeof(resp), "{\"id\":%u}", id);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
-
     ESP_LOGI(TAG, "Sink '%s' added with id=%u", name, id);
     return ESP_OK;
 }
@@ -610,6 +678,10 @@ static esp_err_t handler_post_sink(httpd_req_t *req)
 static esp_err_t handler_delete_sink(httpd_req_t *req)
 {
     struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
+
+    if (authorize_mutation(req) != ESP_OK) {
+        return ESP_FAIL;
+    }
 
     /* Parse sink ID from URI: /api/sinks/<id> */
     const char *uri = req->uri;
@@ -805,6 +877,8 @@ esp_err_t aes67_webui_init(aes67_node_handle_t node, uint16_t port,
     ctx->port = port;
     ctx->httpd = NULL;
     ctx->running = false;
+    ctx->bucket = MUTATION_BURST;
+    ctx->bucket_last_us = esp_timer_get_time();
     ctx->scratch = calloc(1, sizeof(struct webui_scratch));
     ctx->json = heap_caps_malloc(JSON_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!ctx->json) {
@@ -841,6 +915,9 @@ esp_err_t aes67_webui_start(aes67_webui_handle_t handle)
     config.keep_alive_enable = false;  /* Close HTTP conns immediately, free sockets for WS */
     config.core_id = 1;  /* Run HTTP server on core 1 (audio on core 0) */
     config.close_fn = webui_close_fn;
+    /* The sink delete URI ends in a wildcard; the default matcher is exact,
+     * which left DELETE /api/sinks/N answering 404 from the server. */
+    config.uri_match_fn = httpd_uri_match_wildcard;
 
     esp_err_t ret = httpd_start(&handle->httpd, &config);
     if (ret != ESP_OK) {

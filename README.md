@@ -168,6 +168,31 @@ All parameters are configurable via `idf.py menuconfig` under "AES67 RAVENNA Com
 - I2S pin assignments
 - Task priorities
 
+## Security model
+
+The node is built for a trusted audio network: a studio or venue LAN where
+every host may already inject multicast audio and PTP. Within that model the
+web UI defends against the realistic accidents and against a browser on that
+LAN being turned against the device:
+
+- Everything the device receives from the network (SAP session names, SDP,
+  API bodies) is treated as data. Names are reduced to printable characters,
+  JSON output is escaped, and the page renders text, never markup.
+- Reads (`GET /api/*`, the WebSocket status) are open.
+- Writes (`POST /api/sinks`, `DELETE /api/sinks/N`, controls) require the
+  `X-AES67-Request: 1` header, which a browser does not send cross-origin
+  without a CORS preflight, so a hostile page elsewhere cannot drive the API
+  through your browser. Writes are rate limited (bursts of 5, one per second
+  after) and logged with the client address.
+- Optionally, writes require `Authorization: Bearer <token>` with the token
+  from `CONFIG_AES67_WEBUI_TOKEN`. The page asks for it once per browser
+  session. Set it whenever the device is reachable from outside the audio LAN.
+
+Not defended: a host on the LAN that can already send multicast can still
+announce misleading sessions or flood the PTP domain; there is no TLS, so the
+token travels in clear on that LAN; and the firmware has no notion of users.
+Put the device behind a firewall if any of that matters in your deployment.
+
 ## Usage
 
 ```c

@@ -201,6 +201,17 @@ menu "AES67 RAVENNA Component"
         help
             TCP port for the embedded web server.
 
+    config AES67_WEBUI_TOKEN
+        string "WebUI control token (empty = no token)"
+        default ""
+        depends on AES67_WEBUI_ENABLED
+        help
+            When set, requests that change state (adding or removing sinks,
+            controls) must carry "Authorization: Bearer <token>". The page asks
+            for it once per browser session. Reads stay open. Leave empty on a
+            trusted audio LAN; set it when the device is reachable from
+            elsewhere. See README "Security model".
+
     config AES67_WEBUI_PUSH_INTERVAL_MS
         int "WebUI status push interval (ms)"
         default 500
