@@ -159,8 +159,10 @@ static void audio_frame_task(void *arg)
         aes67_rtp_engine_process_tx(node->rtp, rtp_ts);
     }
 
+    heap_caps_free(cap_samples);
+    heap_caps_free(playback_buf);
     ESP_LOGI(TAG, "Audio frame task stopped");
-        xSemaphoreGive(node->tic_done);
+    xSemaphoreGive(node->tic_done);
     vTaskDelete(NULL);
 }
 
@@ -315,7 +317,7 @@ static void playback_task(void *arg)
 
     heap_caps_free(pcm_buf);
     ESP_LOGI(TAG, "Playback task stopped");
-        xSemaphoreGive(node->pb_done);
+    xSemaphoreGive(node->pb_done);
     vTaskDelete(NULL);
 }
 
@@ -328,8 +330,14 @@ static void audio_frame_callback(uint32_t frame_count, void *user_data)
 
 esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *handle)
 {
-    if (!handle) {
+    if (!handle || !config || !config->net.eth_handle) {
+        /* The Ethernet handle is required for PTP and the frame timer, so
+         * a NULL config cannot work; say so instead of failing later. */
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_node) {
+        ESP_LOGE(TAG, "only one node instance is supported");
+        return ESP_ERR_INVALID_STATE;
     }
 
     struct aes67_node *node = calloc(1, sizeof(struct aes67_node));
@@ -337,14 +345,7 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
         ESP_LOGE(TAG, "failed to allocate node context");
         return ESP_ERR_NO_MEM;
     }
-
-    /* Apply caller config or fall back to Kconfig defaults */
-    if (config) {
-        memcpy(&node->config, config, sizeof(aes67_config_t));
-    } else {
-        aes67_config_t defaults = AES67_CONFIG_DEFAULT();
-        memcpy(&node->config, &defaults, sizeof(aes67_config_t));
-    }
+    memcpy(&node->config, config, sizeof(aes67_config_t));
 
     esp_err_t ret;
 
@@ -430,6 +431,9 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
     return ESP_OK;
 
 fail_cb:
+    if (s_frame_sem) { vSemaphoreDelete(s_frame_sem); s_frame_sem = NULL; }
+    if (node->tic_done) vSemaphoreDelete(node->tic_done);
+    if (node->pb_done) vSemaphoreDelete(node->pb_done);
     aes67_session_destroy(node->session);
 fail_session:
     aes67_audio_destroy(node->audio);
@@ -614,6 +618,16 @@ esp_err_t aes67_node_destroy(aes67_node_handle_t handle)
 
     aes67_rtp_engine_destroy(handle->rtp);
     aes67_ptp_destroy(handle->ptp);
+
+    /* Frame timer and the ISR -> task semaphore (file statics, single node) */
+    aes67_hw_timer_deinit();
+    if (s_frame_sem) {
+        vSemaphoreDelete(s_frame_sem);
+        s_frame_sem = NULL;
+    }
+    vSemaphoreDelete(handle->tic_done);
+    vSemaphoreDelete(handle->pb_done);
+    s_node = NULL;
 
     ESP_LOGI(TAG, "node \"%s\" destroyed", handle->config.node_name);
     free(handle);

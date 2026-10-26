@@ -54,6 +54,11 @@ esp_err_t aes67_hw_timer_rearm(void);
  */
 esp_err_t aes67_hw_timer_stop(void);
 
+/**
+ * Unregister the ISR and forget the configuration (inverse of init).
+ */
+esp_err_t aes67_hw_timer_deinit(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -45,6 +45,11 @@ esp_err_t aes67_webui_start(aes67_webui_handle_t handle);
  */
 esp_err_t aes67_webui_stop(aes67_webui_handle_t handle);
 
+/**
+ * Stop if running and free the context. The handle is invalid afterwards.
+ */
+esp_err_t aes67_webui_destroy(aes67_webui_handle_t handle);
+
 /* ---- Runtime controls ----
  *
  * The application registers named integer controls (a codec's mic gain, a

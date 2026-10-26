@@ -409,6 +409,7 @@ esp_err_t aes67_ptp_destroy(aes67_ptp_handle_t handle)
         }
     }
 
+    vSemaphoreDelete(handle->monitor_done);
     free(handle);
     ESP_LOGI(TAG, "PTP context destroyed");
     return ESP_OK;

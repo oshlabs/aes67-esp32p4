@@ -289,7 +289,10 @@ void aes67_audio_set_isr_stream_buf(aes67_audio_handle_t handle,
                                      StreamBufferHandle_t sbuf)
 {
     (void)handle;
-    s_isr_stream_buf = xStreamBufferCreate(65536, 1);
+    (void)sbuf;
+    if (!s_isr_stream_buf) {
+        s_isr_stream_buf = xStreamBufferCreate(65536, 1);
+    }
     ESP_LOGI("aes67_audio", "ISR playback stream buffer: 64KB");
 }
 
@@ -327,7 +330,9 @@ StreamBufferHandle_t aes67_audio_get_capture_buf(aes67_audio_handle_t handle)
 void aes67_audio_init_capture(aes67_audio_handle_t handle)
 {
     (void)handle;
-    s_capture_stream_buf = xStreamBufferCreate(65536, 1);
+    if (!s_capture_stream_buf) {
+        s_capture_stream_buf = xStreamBufferCreate(65536, 1);
+    }
     ESP_LOGI("aes67_audio", "ISR capture stream buffer: 64KB");
 }
 
@@ -436,6 +441,7 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     size_t ring_bytes = ring_frames * audio_config->channels * sizeof(int32_t);
     uint32_t alloc_caps = use_psram ? MALLOC_CAP_SPIRAM : MALLOC_CAP_DEFAULT;
 
+    esp_err_t ret = ESP_ERR_NO_MEM;
     ctx->capture_buf = heap_caps_calloc(1, ring_bytes, alloc_caps);
     ctx->playback_buf = heap_caps_calloc(1, ring_bytes, alloc_caps);
     if (!ctx->capture_buf || !ctx->playback_buf) {
@@ -465,7 +471,7 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
      * i2s_channel_write compatibility in non-ISR modes. */
     chan_cfg.auto_clear = (s_isr_stream_buf != NULL);
 
-    esp_err_t ret = i2s_new_channel(&chan_cfg, &ctx->tx_chan, &ctx->rx_chan);
+    ret = i2s_new_channel(&chan_cfg, &ctx->tx_chan, &ctx->rx_chan);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(ret));
         goto err_free_bufs;
@@ -526,6 +532,7 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
                                          MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!ctx->staging_buf) {
         ESP_LOGE(TAG, "Failed to allocate staging ring");
+        ret = ESP_ERR_NO_MEM;
         goto err_del_channel;
     }
     ctx->staging_wr = 0;
@@ -536,6 +543,7 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     ctx->dma_sem = xSemaphoreCreateBinary();
     if (!ctx->dma_sem) {
         ESP_LOGE(TAG, "Failed to create DMA semaphore");
+        ret = ESP_ERR_NO_MEM;
         goto err_del_channel;
     }
 
@@ -548,6 +556,7 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     if (!ctx->i2s_conv_buf) {
         ESP_LOGE(TAG, "Failed to allocate I2S conversion buffer (%lu bytes)",
                  (unsigned long)(ctx->i2s_conv_buf_samples * sizeof(int16_t)));
+        ret = ESP_ERR_NO_MEM;
         goto err_del_channel;
     }
 
@@ -557,6 +566,10 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     return ESP_OK;
 
 err_del_channel:
+    /* Only reached once both channels exist; the i2s_new_channel failure
+     * path lands at err_free_bufs instead. */
+    if (ctx->dma_sem) vSemaphoreDelete(ctx->dma_sem);
+    heap_caps_free(ctx->staging_buf);
     i2s_del_channel(ctx->tx_chan);
     i2s_del_channel(ctx->rx_chan);
 err_free_bufs:
@@ -565,7 +578,7 @@ err_free_bufs:
     heap_caps_free(ctx->dma_rx_buf);
     heap_caps_free(ctx->dma_tx_buf);
     free(ctx);
-    return ESP_ERR_NO_MEM;
+    return ret;
 }
 
 esp_err_t aes67_audio_start(aes67_audio_handle_t handle)
@@ -680,6 +693,19 @@ esp_err_t aes67_audio_destroy(aes67_audio_handle_t handle)
     heap_caps_free(handle->dma_rx_buf);
     heap_caps_free(handle->dma_tx_buf);
     heap_caps_free(handle->i2s_conv_buf);
+    heap_caps_free(handle->staging_buf);
+    if (handle->dma_sem) {
+        vSemaphoreDelete(handle->dma_sem);
+    }
+    /* The two ISR stream buffers are file statics (single instance) */
+    if (s_isr_stream_buf) {
+        vStreamBufferDelete(s_isr_stream_buf);
+        s_isr_stream_buf = NULL;
+    }
+    if (s_capture_stream_buf) {
+        vStreamBufferDelete(s_capture_stream_buf);
+        s_capture_stream_buf = NULL;
+    }
 
     free(handle);
     ESP_LOGI(TAG, "Audio driver destroyed");

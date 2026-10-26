@@ -1190,6 +1190,18 @@ esp_err_t aes67_webui_stop(aes67_webui_handle_t handle)
     return ESP_OK;
 }
 
+esp_err_t aes67_webui_destroy(aes67_webui_handle_t handle)
+{
+    if (!handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    aes67_webui_stop(handle);
+    free(handle->scratch);
+    free(handle->json);
+    free(handle);
+    return ESP_OK;
+}
+
 esp_err_t aes67_webui_add_control(aes67_webui_handle_t handle,
                                   const aes67_webui_control_t *control)
 {

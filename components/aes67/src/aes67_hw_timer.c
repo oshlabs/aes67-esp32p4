@@ -168,3 +168,12 @@ esp_err_t aes67_hw_timer_stop(void)
     ESP_LOGI(TAG, "stopped");
     return ESP_OK;
 }
+
+esp_err_t aes67_hw_timer_deinit(void)
+{
+    s_timer.running = false;
+    /* Unhook the ISR from the EMAC target-time interrupt */
+    esp_eth_clock_register_target_cb(CLOCK_PTP_SYSTEM, NULL);
+    memset(&s_timer, 0, sizeof(s_timer));
+    return ESP_OK;
+}

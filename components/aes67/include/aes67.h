@@ -49,7 +49,9 @@ ESP_EVENT_DECLARE_BASE(AES67_EVENT);
  * Brings up PTP, RTP engine, SAP, mDNS and audio subsystems.
  * The Ethernet interface must already be initialized and connected.
  *
- * @param config  Node configuration. NULL uses defaults from Kconfig.
+ * @param config  Node configuration; required, and config->net.eth_handle
+ *                must be set. Start from AES67_CONFIG_DEFAULT() and fill
+ *                in the Ethernet handle and I2S pins. One node per device.
  * @param handle  Output handle for the created node instance.
  * @return ESP_OK on success
  */

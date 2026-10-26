@@ -713,6 +713,9 @@ esp_err_t aes67_rtp_engine_init(const aes67_net_config_t *net_config,
         if (engine->rx_sock < 0) {
             ESP_LOGE(TAG, "Failed to create RX socket on port %u",
                      net_config->rtp_port);
+            if (engine->audio_stream_buf) vStreamBufferDelete(engine->audio_stream_buf);
+            vSemaphoreDelete(engine->lock);
+            vSemaphoreDelete(engine->rx_done);
             free(engine);
             return ESP_FAIL;
         }
@@ -846,6 +849,9 @@ esp_err_t aes67_rtp_engine_destroy(aes67_rtp_engine_handle_t handle)
         engine->rx_sock = -1;
     }
 
+    if (engine->audio_stream_buf) {
+        vStreamBufferDelete(engine->audio_stream_buf);
+    }
     vSemaphoreDelete(engine->lock);
     vSemaphoreDelete(engine->rx_done);
     free(engine);
