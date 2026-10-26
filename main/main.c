@@ -47,10 +47,7 @@
 #include "aes67_audio.h"
 #include "dsps_tone_gen.h"
 #include "driver/i2c.h"
-#include "freertos/stream_buffer.h"
-#include "esp_cache.h"
 #include "esp_ldo_regulator.h"
-#include "driver/i2s_std.h"
 #include "es8311.h"
 #include "nvs.h"
 #include "aes67_webui.h"
@@ -58,10 +55,6 @@
 /* Session handle for SAP callback */
 static aes67_session_handle_t s_session = NULL;
 static bool s_sink_added = false;
-
-/* Stream params for the Ethernet RTP hook (defined below, used by SAP callback) */
-extern uint8_t s_hook_word_length;
-extern uint8_t s_hook_channels;
 
 /* SAP discovery callback: auto-subscribe to discovered remote sources */
 static void sap_discovery_cb(bool is_announce,
@@ -81,16 +74,8 @@ static void sap_discovery_cb(bool is_announce,
                                             source->sdp, &sink_id);
     if (err == ESP_OK) {
         s_sink_added = true;
-        /* Update Ethernet hook params from the SDP */
         aes67_sink_t sink;
         if (aes67_session_get_sink(s_session, sink_id, &sink) == ESP_OK) {
-            s_hook_word_length = sink.rtp_config.word_length;
-            s_hook_channels = sink.rtp_config.channels;
-            ESP_LOGI("main", "Hook: wl=%u ch=%u rate=%lu ptime=%u",
-                     s_hook_word_length, s_hook_channels,
-                     (unsigned long)sink.rtp_config.sample_rate,
-                     sink.rtp_config.packet_time_us);
-
             /* Create a matching source with same codec/channels/ptime */
             aes67_session_set_packet_time(s_session, sink.rtp_config.packet_time_us);
             uint8_t src_id = 0;
@@ -180,161 +165,6 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-/* --- Ethernet RTP hook: intercept RTP frames before lwIP --- */
-
-static esp_err_t (*s_original_input)(esp_eth_handle_t, uint8_t*, uint32_t, void*, void*) = NULL;
-static void *s_original_priv = NULL;
-static i2s_chan_handle_t s_hook_tx_chan = NULL;
-static int32_t *s_hook_tmp32 = NULL;
-static int16_t *s_hook_i16 = NULL;
-uint32_t s_hook_pkt_count = 0;             /* Visible to webui for stats */
-uint32_t s_hook_drop_count = 0;
-uint32_t s_hook_fwd_count = 0;
-uint32_t s_hook_total_frames = 0;
-static uint16_t s_hook_last_seq = 0;
-static uint32_t s_hook_seq_gaps = 0;
-uint32_t s_hook_seq_lost = 0;
-StreamBufferHandle_t s_hook_sbuf = NULL;  /* Global: shared with playback task */
-uint8_t s_hook_word_length = 3;          /* Default L24. Updated from SDP. */
-uint8_t s_hook_channels = 2;             /* Default stereo. Updated from SDP. */
-
-/* Called for EVERY Ethernet frame, before lwIP.
- * RTP multicast on port 5004: process + free. Everything else: forward to lwIP. */
-static esp_err_t IRAM_ATTR eth_rtp_hook(esp_eth_handle_t eth_handle,
-                                          uint8_t *buffer, uint32_t length,
-                                          void *priv, void *info)
-{
-    s_hook_total_frames++;
-
-    /* PTP over UDP goes to the daemon with its hardware receive timestamp */
-    if (aes67_ptp_eth_input(buffer, length, info)) {
-        free(buffer);
-        return ESP_OK;
-    }
-
-    /* Quick reject: minimum Ethernet+IP+UDP+RTP header = 54 bytes */
-    if (length < 54 || !s_hook_tx_chan) goto forward;
-
-    /* EtherType must be IPv4 */
-    if (buffer[12] != 0x08 || buffer[13] != 0x00) goto forward;
-
-    /* IP protocol must be UDP (17) */
-    uint8_t ihl = (buffer[14] & 0x0F) * 4;
-    if (buffer[14 + 9] != 17) goto forward;
-
-    /* Must be IPv4 multicast destination (224.0.0.0/4) */
-    if ((buffer[14 + 16] & 0xF0) != 0xE0) goto forward;
-
-    /* UDP destination port must be 5004 */
-    int udp_off = 14 + ihl;
-    uint16_t dst_port = (buffer[udp_off + 2] << 8) | buffer[udp_off + 3];
-    if (dst_port != 5004) goto forward;
-
-    /* RTP version must be 2 */
-    int rtp_off = udp_off + 8;
-    if ((buffer[rtp_off] >> 6) != 2) goto forward;
-
-    /* Track RTP sequence numbers to detect packet loss */
-    {
-        uint16_t seq = (buffer[rtp_off + 2] << 8) | buffer[rtp_off + 3];
-        if (s_hook_pkt_count > 0) {
-            uint16_t expected = s_hook_last_seq + 1;
-            if (seq != expected) {
-                int16_t gap = (int16_t)(seq - expected);
-                if (gap > 0 && gap < 100) {
-                    s_hook_seq_gaps++;
-                    s_hook_seq_lost += gap;
-                }
-            }
-        }
-        s_hook_last_seq = seq;
-    }
-
-    /* Extract RTP payload */
-    uint8_t cc = buffer[rtp_off] & 0x0F;
-    int payload_off = rtp_off + 12 + cc * 4;
-
-    /* Handle RTP header extension */
-    if (buffer[rtp_off] & 0x10) {
-        if ((int)length < payload_off + 4) goto forward;
-        uint16_t ext_len = (buffer[payload_off + 2] << 8) | buffer[payload_off + 3];
-        payload_off += 4 + ext_len * 4;
-    }
-
-    if (payload_off >= (int)length) goto forward;
-
-    const uint8_t *payload = buffer + payload_off;
-    int payload_len = length - payload_off;
-
-    /* ESP-IDF Ethernet driver already does M2C cache sync in
-     * emac_esp_dma_receive_frame(). No additional sync needed. */
-
-    /* Handle RTP padding (P bit) */
-    if (buffer[rtp_off] & 0x20) {
-        uint8_t pad_len = buffer[length - 1];
-        payload_len -= pad_len;
-        if (payload_len <= 0) goto forward;
-    }
-
-    /* Use UDP length field instead of Ethernet frame length to avoid
-     * including Ethernet FCS or padding bytes in the audio data.
-     * UDP length = header(8) + payload. */
-    uint16_t udp_len = (buffer[udp_off + 4] << 8) | buffer[udp_off + 5];
-    int rtp_total = udp_len - 8;  /* UDP payload = RTP header + RTP payload */
-    int rtp_payload = rtp_total - (payload_off - rtp_off);
-    if (rtp_payload > 0 && rtp_payload < payload_len) {
-        payload_len = rtp_payload;  /* Trim to actual RTP payload */
-    }
-
-    /* Use word length and channel count from SDP (set when sink is added) */
-    int wl = s_hook_word_length;
-    int ch = s_hook_channels;
-    int frame_bytes = ch * wl;
-    int frames = payload_len / frame_bytes;
-    if (frames <= 0 || frames > AES67_MAX_TIC_FRAMES) goto forward;
-
-    /* Log first packet details */
-    if (s_hook_pkt_count == 0) {
-        ESP_DRAM_LOGI("eth_hook", "FIRST PKT: payload=%d bytes, wl=%d, ch=%d, frames=%d, "
-                      "write_bytes=%d", payload_len, wl, ch, frames,
-                      frames * ch * (int)sizeof(int32_t));
-    }
-
-    /* Convert to int32 -- stereo passthrough, no mono mix */
-    aes67_convert_from_net(payload, s_hook_tmp32, frames, ch, wl);
-
-    /* Write int32 stereo directly to stream buffer (read by DMA ISR) */
-    extern void aes67_audio_slot_write(const void *data, uint32_t len);
-    aes67_audio_slot_write(s_hook_tmp32, frames * ch * sizeof(int32_t));
-
-    s_hook_pkt_count++;
-
-    /* Rate-limited loss reporting: max once per second */
-    static uint32_t s_last_seq_lost = 0;
-    static uint32_t s_last_loss_log_pkt = 0;
-    if (s_hook_seq_lost != s_last_seq_lost &&
-        (s_hook_pkt_count - s_last_loss_log_pkt) > 8000) {
-        ESP_LOGW("eth_hook", "SEQ LOSS: %lu gaps, %lu lost (total %lu pkts)",
-                 (unsigned long)s_hook_seq_gaps,
-                 (unsigned long)s_hook_seq_lost,
-                 (unsigned long)s_hook_pkt_count);
-        s_last_seq_lost = s_hook_seq_lost;
-        s_last_loss_log_pkt = s_hook_pkt_count;
-    }
-
-    free(buffer);  /* We consumed the frame */
-    return ESP_OK;
-
-forward:
-    s_hook_fwd_count++;
-    /* Not RTP -- forward to lwIP via esp_netif_receive */
-    if (s_original_priv) {
-        return esp_netif_receive((esp_netif_t *)s_original_priv, buffer, length, NULL);
-    }
-    free(buffer);
-    return ESP_OK;
-}
-
 /*
  * Initialize the IP101 Ethernet PHY over RMII.
  * The ESP32-P4-NANO uses an external 50MHz crystal for the RMII reference
@@ -401,18 +231,6 @@ static esp_err_t ethernet_init(esp_eth_handle_t *out_eth_handle)
                                                &eth_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
                                                &ip_event_handler, NULL));
-
-    /* Ethernet RTP hook: intercept RTP at MAC level before lwIP */
-    s_original_priv = eth_netif;
-    /* 192 frames * max channels covers the AES67 practical max (4ms at 48kHz) */
-    s_hook_tmp32 = heap_caps_malloc(
-        192 * AES67_MAX_CHANNELS_PER_STREAM * sizeof(int32_t),
-        MALLOC_CAP_INTERNAL);
-    s_hook_i16 = heap_caps_malloc(
-        192 * AES67_MAX_CHANNELS_PER_STREAM * sizeof(int16_t),
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    esp_eth_update_input_path_info(eth_handle, eth_rtp_hook, eth_netif);
-    ESP_LOGI(TAG, "Ethernet RTP hook installed");
 
     /* Enable Ethernet flow control to prevent frame drops under load.
      * Without this, the EMAC drops ~8% of multicast frames at high
@@ -686,31 +504,8 @@ void app_main(void)
     aes67_node_handle_t node = NULL;
     ESP_ERROR_CHECK(aes67_node_init(&aes67_cfg, &node));
 
-    /* Create stream buffer BEFORE starting the node. The DMA ISR callback
-     * reads directly from this buffer, bypassing the playback task.
-     * 30 packets (~120ms at 4ms ptime) for jitter absorption.
-     * Trigger=1: ISR always reads whatever is available. */
-    {
-        uint32_t pkt_bytes = 192 * aes67_cfg.audio.channels * sizeof(int32_t);
-        s_hook_sbuf = xStreamBufferCreate(pkt_bytes * 30, 1);
-
-        /* Wire the stream buffer to the audio driver's DMA ISR */
-        aes67_audio_handle_t audio = NULL;
-        aes67_node_get_audio(node, &audio);
-        aes67_audio_set_isr_stream_buf(audio, s_hook_sbuf);
-        /* Also register it as the node's playout source for the (non-ISR)
-         * playback-task fallback path. */
-        aes67_node_set_playout_buf(node, s_hook_sbuf);
-        /* Enable I2S RX capture for source (TX) streams */
-        aes67_audio_init_capture(audio);
-        s_hook_tx_chan = aes67_audio_get_tx_chan(audio);
-        ESP_LOGI(TAG, "Ethernet hook -> stream buffer -> DMA ISR (zero-overhead)");
-        ESP_LOGI(TAG, "I2S RX capture -> stream buffer -> RTP TX (ISR-driven)");
-    }
-
-    /* Start PTP sync, RTP engine, SAP announcements and audio I/O.
-     * This enables I2S which starts MCLK generation. The DMA ISR
-     * callback is registered during audio start. */
+    /* Start PTP sync, RTP engine, SAP announcements, the Ethernet receive
+     * hook and audio I/O. This enables I2S, which starts MCLK generation. */
     ESP_ERROR_CHECK(aes67_node_start(node));
 
     /* Initialize ES8311 codec AFTER I2S is running (MCLK must be active).

@@ -729,13 +729,6 @@ esp_err_t aes67_node_get_rtp(aes67_node_handle_t handle,
     return ESP_OK;
 }
 
-esp_err_t aes67_node_set_playout_buf(aes67_node_handle_t handle,
-                                      StreamBufferHandle_t sbuf)
-{
-    (void)sbuf;
-    return handle ? ESP_OK : ESP_ERR_INVALID_ARG;
-}
-
 esp_err_t aes67_node_get_rx_stats(aes67_node_handle_t handle, aes67_node_rx_stats_t *stats)
 {
     if (!handle || !stats) {

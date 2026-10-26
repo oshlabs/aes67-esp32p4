@@ -192,15 +192,6 @@ static volatile uint32_t s_isr_fires = 0;
 static volatile uint32_t s_isr_full = 0;
 static volatile uint32_t s_isr_empty = 0;
 
-/* Write audio data to the stream buffer (called from Ethernet hook).
- * Handles any packet size -- multiple small packets accumulate until
- * the ISR reads a full DMA descriptor. */
-void aes67_audio_slot_write(const void *data, uint32_t len)
-{
-    if (s_isr_stream_buf && len > 0) {
-        xStreamBufferSend(s_isr_stream_buf, data, len, 0);
-    }
-}
 
 /* Last frame for sample-hold on underrun (less audible than silence) */
 static int32_t s_last_frame[2] = {0, 0};  /* Stereo max */
@@ -290,13 +281,6 @@ StreamBufferHandle_t aes67_audio_get_playout_buf(aes67_audio_handle_t handle)
     return s_isr_stream_buf;
 }
 
-/* Deprecated: the driver creates its playout buffer at init. */
-void aes67_audio_set_isr_stream_buf(aes67_audio_handle_t handle,
-                                     StreamBufferHandle_t sbuf)
-{
-    (void)handle;
-    (void)sbuf;
-}
 
 /* --- I2S RX Capture ISR (I2S -> AES67 TX source) --- */
 
@@ -327,11 +311,6 @@ StreamBufferHandle_t aes67_audio_get_capture_buf(aes67_audio_handle_t handle)
     return s_capture_stream_buf;
 }
 
-/* Deprecated: the driver creates its capture buffer at init. */
-void aes67_audio_init_capture(aes67_audio_handle_t handle)
-{
-    (void)handle;
-}
 
 /* Legacy staging ISR (unused, kept for reference) */
 __attribute__((unused))

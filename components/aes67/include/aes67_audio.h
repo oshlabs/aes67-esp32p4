@@ -136,30 +136,10 @@ void aes67_audio_get_staging_stats(aes67_audio_handle_t handle,
 StreamBufferHandle_t aes67_audio_get_playout_buf(aes67_audio_handle_t handle);
 
 /**
- * Initialize ISR-driven playback via slot ring. Must be called
- * BEFORE aes67_audio_start(). The DMA ISR reads from the slot ring
- * which is fed by aes67_audio_slot_write().
- */
-#include "freertos/stream_buffer.h"
-void aes67_audio_set_isr_stream_buf(aes67_audio_handle_t handle,
-                                     StreamBufferHandle_t sbuf);
-
-/**
- * Write one packet to the slot ring (called from Ethernet hook).
- */
-void aes67_audio_slot_write(const void *data, uint32_t len);
-
-/**
  * Log ISR statistics.
  */
 void aes67_audio_log_isr_stats(void);
 
-/**
- * Initialize I2S RX capture for source (TX) streams.
- * The DMA ISR copies captured int32 samples to a stream buffer.
- * Must be called BEFORE aes67_audio_start().
- */
-void aes67_audio_init_capture(aes67_audio_handle_t handle);
 
 /**
  * Get the capture stream buffer for reading captured I2S audio.

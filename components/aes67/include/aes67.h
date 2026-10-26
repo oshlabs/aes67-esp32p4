@@ -127,11 +127,6 @@ typedef struct {
 
 esp_err_t aes67_node_get_rx_stats(aes67_node_handle_t handle, aes67_node_rx_stats_t *stats);
 
-/**
- * Deprecated and ignored: the node now owns the receive path. Will be removed.
- */
-esp_err_t aes67_node_set_playout_buf(aes67_node_handle_t handle,
-                                      StreamBufferHandle_t sbuf);
 
 #ifdef __cplusplus
 }
