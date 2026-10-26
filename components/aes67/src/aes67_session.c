@@ -16,6 +16,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_event.h"
+#include "aes67.h"
 
 #include "aes67_session.h"
 #include "aes67_rtp.h"
@@ -301,6 +303,7 @@ esp_err_t aes67_session_add_source(aes67_session_handle_t handle,
 
     ESP_LOGI(TAG, "source '%s' added (id=%d, channels=%d, ssrc=0x%08lx)",
              name, slot, channels, (unsigned long)ssrc);
+    esp_event_post(AES67_EVENT, AES67_EVENT_SOURCE_ADDED, id, sizeof(*id), 0);
     ESP_LOGI(TAG, "SDP:\n%s", sdp_text);
     return ESP_OK;
 }
@@ -403,6 +406,7 @@ esp_err_t aes67_session_add_sink(aes67_session_handle_t handle,
              (unsigned long)sdp.sample_rate, sdp.channels, sdp.word_length,
              sdp.ptime_us,
              sdp.session_name, sdp.port, sdp.payload_type);
+    esp_event_post(AES67_EVENT, AES67_EVENT_SINK_ADDED, id, sizeof(*id), 0);
     ESP_LOGI(TAG, "sink SDP:\n%s", sdp_text);
     return ESP_OK;
 }
@@ -457,6 +461,7 @@ esp_err_t aes67_session_remove_source(aes67_session_handle_t handle, uint8_t id)
     xSemaphoreGive(mgr->lock);
 
     ESP_LOGI(TAG, "source '%s' removed (id=%d)", name_copy, id);
+    esp_event_post(AES67_EVENT, AES67_EVENT_SOURCE_REMOVED, &id, sizeof(id), 0);
     return ESP_OK;
 }
 
@@ -492,6 +497,7 @@ esp_err_t aes67_session_remove_sink(aes67_session_handle_t handle, uint8_t id)
     xSemaphoreGive(mgr->lock);
 
     ESP_LOGI(TAG, "sink '%s' removed (id=%d)", name_copy, id);
+    esp_event_post(AES67_EVENT, AES67_EVENT_SINK_REMOVED, &id, sizeof(id), 0);
     return ESP_OK;
 }
 

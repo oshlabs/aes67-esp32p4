@@ -208,23 +208,26 @@ static bool jb_quoted(jbuf_t *jb, const char *s)
 
 static void json_ptp_object(jbuf_t *jb, const aes67_ptp_status_t *st)
 {
-    /* We are GM if locked with zero offset and zero path delay
-     * (a slave always has non-zero offset/delay from the master) */
-    bool is_gm = (st->lock_state == AES67_PTP_LOCKED &&
-                  st->offset_ns == 0 && st->path_delay_ns == 0);
+    const char *transport = st->transport == AES67_PTP_TRANSPORT_L2 ? "l2" :
+                            st->transport == AES67_PTP_TRANSPORT_UDP ? "udp" : "none";
     jb_printf(jb,
         "{\"lock_state\":\"%s\","
         "\"grandmaster\":\"%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X\","
-        "\"is_gm\":%s,\"domain\":%u,"
-        "\"offset_ns\":%ld,\"jitter_ns\":%ld,\"path_delay_ns\":%ld}",
+        "\"is_gm\":%s,\"transport\":\"%s\",\"domain\":%u,"
+        "\"master_class\":%u,\"master_accuracy\":%u,"
+        "\"offset_ns\":%ld,\"filtered_offset_ns\":%ld,\"jitter_ns\":%ld,"
+        "\"drift_ppb\":%ld,\"path_delay_ns\":%ld}",
         ptp_lock_str(st->lock_state),
         st->grandmaster_id[0], st->grandmaster_id[1],
         st->grandmaster_id[2], st->grandmaster_id[3],
         st->grandmaster_id[4], st->grandmaster_id[5],
         st->grandmaster_id[6], st->grandmaster_id[7],
-        is_gm ? "true" : "false",
+        st->is_grandmaster ? "true" : "false",
+        transport,
         st->domain,
-        (long)st->offset_ns, (long)st->jitter_ns, (long)st->path_delay_ns);
+        st->master_clock_class, st->master_accuracy,
+        (long)st->offset_ns, (long)st->filtered_offset_ns, (long)st->jitter_ns,
+        (long)st->drift_ppb, (long)st->path_delay_ns);
 }
 
 static void json_info_object(jbuf_t *jb, struct aes67_webui *ctx)

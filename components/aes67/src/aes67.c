@@ -324,10 +324,17 @@ static void playback_task(void *arg)
 }
 
 /*
- * Audio frame callback from I2S DMA (unused - kept for API compat).
+ * PTP lock transitions: post to the application event loop (if one exists)
+ * so applications can react, and log.
  */
-static void audio_frame_callback(uint32_t frame_count, void *user_data)
+static void node_ptp_lock_cb(aes67_ptp_lock_state_t state, void *user_data)
 {
+    aes67_event_t ev = (state == AES67_PTP_LOCKED) ? AES67_EVENT_PTP_LOCKED
+                                                   : AES67_EVENT_PTP_UNLOCKED;
+    esp_err_t err = esp_event_post(AES67_EVENT, ev, &state, sizeof(state), 0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "event post failed: %s", esp_err_to_name(err));
+    }
 }
 
 esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *handle)
@@ -402,13 +409,8 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
         goto fail_session;
     }
 
-    /* 6. Register the audio frame callback (for I2S DMA capture handling) */
-    ret = aes67_audio_register_frame_cb(node->audio, audio_frame_callback, node);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "audio frame callback registration failed: %s",
-                 esp_err_to_name(ret));
-        goto fail_cb;
-    }
+    /* 6. PTP lock transitions reach the application through the event loop */
+    aes67_ptp_register_lock_cb(node->ptp, node_ptp_lock_cb, node);
 
     /* 7. Initialize hardware PTP frame timer for RTP TX.
      * frame_period = samples_per_packet / sample_rate in nanoseconds */

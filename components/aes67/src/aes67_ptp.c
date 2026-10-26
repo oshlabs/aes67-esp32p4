@@ -26,10 +26,22 @@
 
 static const char *TAG = "aes67_ptp";
 
-/* Thresholds for lock state machine */
+/* Lock state machine: driven by a low-pass filtered offset with hysteresis.
+ *   unlocked -> locking   when |filtered| < 10 ms
+ *   locking  -> locked    when |filtered| < threshold for STABLE_COUNT polls
+ *   locked   -> locking   when |filtered| > 5 x threshold
+ *   any      -> unlocked  when |filtered| > 10 ms
+ * The threshold is a Kconfig value because achievable accuracy depends on
+ * the transport: a few microseconds with hardware timestamps, tens with
+ * software timestamps. */
 #define PTP_LOCKING_THRESHOLD_NS    (10 * 1000 * 1000)   /* 10 ms  */
-#define PTP_LOCKED_THRESHOLD_NS     (1000)                /* 1 us   */
-#define PTP_LOCKED_STABLE_COUNT     4                     /* iterations at < 1us before locked */
+#define PTP_LOCKED_THRESHOLD_NS     CONFIG_AES67_PTP_LOCK_THRESHOLD_NS
+#define PTP_UNLOCK_HYSTERESIS       5
+#define PTP_LOCKED_STABLE_COUNT     4
+#define PTP_FILTER_SHIFT            2                     /* EMA alpha = 1/4 */
+/* Do not claim to be grandmaster until this long has passed without an
+ * Announce from anyone; three announce intervals. */
+#define PTP_GM_GRACE_MS             (3 * CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MSEC)
 #define PTP_MONITOR_INTERVAL_MS     500
 #define PTP_MONITOR_STACK_SIZE      4096
 #define PTP_MONITOR_PRIORITY        10  /* Above SAP, below RTP/audio */
@@ -69,7 +81,14 @@ struct aes67_ptp_ctx {
     /* Cached status values */
     int32_t offset_ns;
     int32_t path_delay_ns;
-    int32_t jitter_ns;      /* drift rate in ppb, used as jitter indicator */
+    int32_t drift_ppb;
+    int32_t filtered_offset_ns;
+    int32_t jitter_ns;
+    bool filter_primed;
+    aes67_ptp_transport_t transport;
+    uint8_t master_clock_class;
+    uint8_t master_accuracy;
+    TickType_t start_tick;  /* when the daemon was started, for the GM grace period */
 
     /* Stats logging counter (prints every N polls) */
     int stats_counter;
@@ -85,7 +104,19 @@ struct aes67_ptp_ctx {
  */
 static bool ptp_update_lock_state(struct aes67_ptp_ctx *ctx, int64_t offset_ns)
 {
-    int64_t abs_offset = (offset_ns < 0) ? -offset_ns : offset_ns;
+    /* Low-pass the raw offset and track how much it moves between polls */
+    if (!ctx->filter_primed) {
+        ctx->filtered_offset_ns = (int32_t)offset_ns;
+        ctx->jitter_ns = 0;
+        ctx->filter_primed = true;
+    } else {
+        int32_t dev = (int32_t)offset_ns - ctx->filtered_offset_ns;
+        ctx->filtered_offset_ns += dev >> PTP_FILTER_SHIFT;
+        int32_t adev = dev < 0 ? -dev : dev;
+        ctx->jitter_ns += (adev - ctx->jitter_ns) >> 3;
+    }
+    int64_t abs_offset = ctx->filtered_offset_ns < 0 ? -ctx->filtered_offset_ns
+                                                     : ctx->filtered_offset_ns;
     aes67_ptp_lock_state_t prev = ctx->lock_state;
 
     switch (ctx->lock_state) {
@@ -121,7 +152,7 @@ static bool ptp_update_lock_state(struct aes67_ptp_ctx *ctx, int64_t offset_ns)
             ctx->lock_state = AES67_PTP_UNLOCKED;
             ctx->stable_count = 0;
             ESP_LOGW(TAG, "PTP lost lock completely (offset %lld ns)", (long long)offset_ns);
-        } else if (abs_offset >= PTP_LOCKED_THRESHOLD_NS) {
+        } else if (abs_offset >= (int64_t)PTP_LOCKED_THRESHOLD_NS * PTP_UNLOCK_HYSTERESIS) {
             ctx->lock_state = AES67_PTP_LOCKING;
             ctx->stable_count = 0;
             ESP_LOGW(TAG, "PTP drifting (offset %lld ns, re-locking)", (long long)offset_ns);
@@ -175,7 +206,10 @@ static void ptp_monitor_task(void *arg)
          * last_delta_ns is the measured clock error from the most recent sync. */
         ctx->offset_ns = (int32_t)status.last_delta_ns;
         ctx->path_delay_ns = (int32_t)status.path_delay_ns;
-        ctx->jitter_ns = (int32_t)status.drift_ppb;
+        ctx->drift_ppb = (int32_t)status.drift_ppb;
+        ctx->transport = (aes67_ptp_transport_t)status.source_transport;
+        ctx->master_clock_class = (uint8_t)status.clock_source_info.clockclass;
+        ctx->master_accuracy = (uint8_t)status.clock_source_info.accuracy;
 
         /* Extract grandmaster identity from status struct */
         memcpy(ctx->grandmaster_id, status.clock_source_info.gm_id, 8);
@@ -183,7 +217,18 @@ static void ptp_monitor_task(void *arg)
         /* Detect if we are the grandmaster. When acting as GM, the ptpd daemon
          * will report no valid clock source, or the GM ID will match our own
          * EUI-64 (MAC with FF:FE inserted in the middle). */
+        /* No master yet: before the grace period has run out we are simply
+         * unlocked, not grandmaster (the clock may still be at the epoch). */
         bool is_self_gm = !status.clock_source_valid;
+        if (is_self_gm &&
+            (xTaskGetTickCount() - ctx->start_tick) < pdMS_TO_TICKS(PTP_GM_GRACE_MS)) {
+            if (ctx->lock_state != AES67_PTP_UNLOCKED) {
+                ctx->lock_state = AES67_PTP_UNLOCKED;
+                ctx->stable_count = 0;
+                if (ctx->lock_cb) ctx->lock_cb(ctx->lock_state, ctx->lock_cb_user_data);
+            }
+            continue;
+        }
         if (!is_self_gm) {
             is_self_gm = (
             ctx->grandmaster_id[0] == ctx->own_mac[0] &&
@@ -252,11 +297,13 @@ static void ptp_monitor_task(void *arg)
                          0xFF, 0xFE,
                          ctx->own_mac[3], ctx->own_mac[4], ctx->own_mac[5]);
             } else {
-                ESP_LOGI(TAG, "[%s/%s] offset: %+ld ns, delay: %ld ns, drift: %+ld ppb, "
-                         "GM: %02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X",
+                ESP_LOGI(TAG, "[%s/%s/%s] offset: %+ld ns (filtered %+ld, jitter %ld), delay: %ld ns, "
+                         "drift: %+ld ppb, GM: %02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X",
                          role, lock,
-                         (long)ctx->offset_ns, (long)ctx->path_delay_ns,
-                         (long)ctx->jitter_ns,
+                         ctx->transport == AES67_PTP_TRANSPORT_L2 ? "l2" :
+                         ctx->transport == AES67_PTP_TRANSPORT_UDP ? "udp" : "-",
+                         (long)ctx->offset_ns, (long)ctx->filtered_offset_ns, (long)ctx->jitter_ns,
+                         (long)ctx->path_delay_ns, (long)ctx->drift_ppb,
                          ctx->grandmaster_id[0], ctx->grandmaster_id[1],
                          ctx->grandmaster_id[2], ctx->grandmaster_id[3],
                          ctx->grandmaster_id[4], ctx->grandmaster_id[5],
@@ -350,6 +397,10 @@ esp_err_t aes67_ptp_start(aes67_ptp_handle_t handle)
     handle->running = true;
     handle->lock_state = AES67_PTP_UNLOCKED;
     handle->stable_count = 0;
+    handle->filter_primed = false;
+    handle->is_grandmaster = false;
+    handle->transport = AES67_PTP_TRANSPORT_NONE;
+    handle->start_tick = xTaskGetTickCount();
 
     ESP_LOGI(TAG, "ptpd started (pid %d)", pid);
 
@@ -440,6 +491,12 @@ esp_err_t aes67_ptp_get_status(aes67_ptp_handle_t handle, aes67_ptp_status_t *st
     status->offset_ns = handle->offset_ns;
     status->path_delay_ns = handle->path_delay_ns;
     status->jitter_ns = handle->jitter_ns;
+    status->drift_ppb = handle->drift_ppb;
+    status->filtered_offset_ns = handle->filtered_offset_ns;
+    status->is_grandmaster = handle->is_grandmaster;
+    status->transport = handle->is_grandmaster ? AES67_PTP_TRANSPORT_NONE : handle->transport;
+    status->master_clock_class = handle->master_clock_class;
+    status->master_accuracy = handle->master_accuracy;
 
     /* When acting as grandmaster, report our own EUI-64 as the GM ID */
     if (handle->is_grandmaster) {

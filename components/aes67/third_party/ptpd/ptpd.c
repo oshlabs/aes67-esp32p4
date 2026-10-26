@@ -168,6 +168,8 @@ struct ptp_state_s
 
   int64_t last_offset_ns;
   int stability_count;        /* consecutive syncs with a stable offset */
+  int rx_transport;           /* transport of the packet being processed: 1 L2, 2 UDP */
+  int source_transport;       /* transport of the selected source */
 
   pi_cntrl_t offset_pi;
 #endif // ESP_PTP
@@ -1401,6 +1403,7 @@ static int ptp_process_announce(FAR struct ptp_state_s *state,
                    msg->gm_identity[6], msg->gm_identity[7]);
 
           state->selected_source = *msg;
+          state->source_transport = state->rx_transport;
           state->last_received_sync = state->last_received_announce;
           state->path_delay_avgcount = 0;
           state->path_delay_ns = 0;
@@ -2059,6 +2062,7 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state)
 
   status = state->status_req.dest;
   status->clock_source_valid = state->selected_source_valid;
+  status->source_transport = state->selected_source_valid ? state->source_transport : 0;
 
   if (status->clock_source_valid)
     {
@@ -2226,6 +2230,7 @@ static int ptp_daemon(int argc, FAR char** argv)
            */
 
 #ifdef ESP_PTP
+          state->rx_transport = 1;
           ret = ptp_net_recv(state, &state->rxbuf, sizeof(state->rxbuf), &state->rxtime);
 #else
           ret = recvmsg(state->event_socket, &rxhdr, MSG_DONTWAIT);
@@ -2250,6 +2255,7 @@ static int ptp_daemon(int argc, FAR char** argv)
                     MSG_DONTWAIT);
           if (ret > 0)
             {
+              state->rx_transport = 2;
               ptp_gettime(state, &state->rxtime);
               ptp_process_rx_packet(state, ret);
             }
@@ -2264,6 +2270,7 @@ static int ptp_daemon(int argc, FAR char** argv)
                     MSG_DONTWAIT);
           if (ret > 0)
             {
+              state->rx_transport = 2;
               ptp_gettime(state, &state->rxtime);
               ptp_process_rx_packet(state, ret);
             }

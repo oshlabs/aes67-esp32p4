@@ -30,14 +30,27 @@ typedef enum {
     AES67_PTP_LOCKED   = 2,
 } aes67_ptp_lock_state_t;
 
+/* Transport the selected master's messages arrive on */
+typedef enum {
+    AES67_PTP_TRANSPORT_NONE = 0,       /* no master selected */
+    AES67_PTP_TRANSPORT_L2   = 1,       /* IEEE 802.3, hardware timestamps */
+    AES67_PTP_TRANSPORT_UDP  = 2,       /* UDP/IPv4 (AES67, RAVENNA, Dante) */
+} aes67_ptp_transport_t;
+
 /* PTP status information */
 typedef struct {
     aes67_ptp_lock_state_t lock_state;
+    bool is_grandmaster;                /* This node is the acting grandmaster */
+    aes67_ptp_transport_t transport;
     uint8_t grandmaster_id[8];          /* EUI-64 grand master identity */
     uint8_t domain;
-    int32_t offset_ns;                  /* Current offset from master in ns */
+    uint8_t master_clock_class;         /* IEEE 1588 clockClass of the master (6 = GPS) */
+    uint8_t master_accuracy;            /* IEEE 1588 clockAccuracy enum of the master */
+    int32_t offset_ns;                  /* Last measured offset from master in ns */
+    int32_t filtered_offset_ns;         /* Low-pass filtered offset used for the lock state */
     int32_t path_delay_ns;              /* Mean path delay in ns */
-    int32_t jitter_ns;                  /* Clock jitter estimate in ns */
+    int32_t jitter_ns;                  /* Filtered magnitude of offset change between syncs */
+    int32_t drift_ppb;                  /* Servo frequency correction in parts per billion */
 } aes67_ptp_status_t;
 
 /* Opaque PTP context */

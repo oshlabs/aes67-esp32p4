@@ -93,6 +93,12 @@ struct ptpd_status_s
 
   long path_delay_ns;
 
+  /* Transport the selected source's announces arrive on:
+   * 0 = none, 1 = IEEE 802.3 (L2, hardware timestamps),
+   * 2 = UDP/IPv4. */
+
+  int source_transport;
+
   /* Timestamps of latest received packets (CLOCK_MONOTONIC) */
 
   struct timespec last_received_multicast; /* Any multicast packet */

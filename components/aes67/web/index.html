@@ -61,7 +61,9 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 <span><span class="lbl">GM </span><span class="val" id="pg">--</span></span>
 <span><span class="lbl">Offset </span><span class="val" id="po">--</span><span class="lbl"> ns</span></span>
 <span><span class="lbl">Jitter </span><span class="val" id="pj">--</span><span class="lbl"> ns</span></span>
+<span><span class="lbl">Drift </span><span class="val" id="pf">--</span><span class="lbl"> ppm</span></span>
 <span><span class="lbl">Delay </span><span class="val" id="py">--</span><span class="lbl"> ns</span></span>
+<span><span class="lbl">Transport </span><span class="val" id="px">--</span></span>
 </div>
 </div>
 <div class="card" id="ctlc" style="display:none"><h2>Controls</h2><div id="ctl"></div></div>
@@ -256,7 +258,9 @@ function onMsg(e){
   else{pt.style.display="none"}
   g("po").textContent=fmt(p.offset_ns);
   g("pj").textContent=fmt(p.jitter_ns);
+  g("pf").textContent=p.drift_ppb!=null?(p.drift_ppb/1000).toFixed(2):"--";
   g("py").textContent=fmt(p.path_delay_ns);
+  g("px").textContent=p.is_gm?"grandmaster":(p.transport==="l2"?"L2 (hw stamps)":p.transport==="udp"?"UDP":"--");
   updateSlots("src",d.sources);
   updateSlots("sink",d.sinks);
   renderRemotes(d.sap_remotes);

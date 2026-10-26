@@ -22,10 +22,6 @@
 extern "C" {
 #endif
 
-/* Audio frame callback (TIC). Invoked once per audio frame period.
- * The callback should read from sink jitter buffers and write to
- * source ring buffers. */
-typedef void (*aes67_audio_frame_cb_t)(uint32_t frame_count, void *user_data);
 
 /* Opaque audio driver handle */
 typedef struct aes67_audio_ctx *aes67_audio_handle_t;
@@ -64,9 +60,6 @@ esp_err_t aes67_audio_destroy(aes67_audio_handle_t handle);
  * Register the audio frame callback. The callback is invoked from a
  * high-priority task each time a DMA transfer completes (one frame period).
  */
-esp_err_t aes67_audio_register_frame_cb(aes67_audio_handle_t handle,
-                                        aes67_audio_frame_cb_t cb,
-                                        void *user_data);
 
 /**
  * Write samples to the playback ring buffer (sink path).

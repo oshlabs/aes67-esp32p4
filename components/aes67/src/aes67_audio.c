@@ -75,8 +75,6 @@ struct aes67_audio_ctx {
     volatile bool staging_ready;          /* ISR reads only when true */
 
     /* Frame callback */
-    aes67_audio_frame_cb_t frame_cb;
-    void *frame_cb_user_data;
 
     /* I/O task */
     TaskHandle_t io_task;
@@ -712,18 +710,6 @@ esp_err_t aes67_audio_destroy(aes67_audio_handle_t handle)
     return ESP_OK;
 }
 
-esp_err_t aes67_audio_register_frame_cb(aes67_audio_handle_t handle,
-                                        aes67_audio_frame_cb_t cb,
-                                        void *user_data)
-{
-    if (!handle) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    handle->frame_cb = cb;
-    handle->frame_cb_user_data = user_data;
-    return ESP_OK;
-}
 
 esp_err_t aes67_audio_write_playback(aes67_audio_handle_t handle,
                                      const void *samples, uint32_t frame_count)

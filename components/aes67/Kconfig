@@ -188,6 +188,16 @@ menu "AES67 RAVENNA Component"
             GPIO pin for I2S serial data input from codec ADC (ASDOUT).
             On ESP32-P4-NANO this is GPIO11.
 
+    config AES67_PTP_LOCK_THRESHOLD_NS
+        int "PTP lock threshold (ns, on the filtered offset)"
+        default 10000
+        range 500 1000000
+        help
+            The node reports PTP "locked" when the low-pass filtered offset to the
+            master stays below this for four polls, and drops back to "locking"
+            above five times this value. With hardware timestamps a few
+            microseconds are achievable; with software timestamps tens.
+
     config AES67_WEBUI_ENABLED
         bool "Enable WebUI"
         default y

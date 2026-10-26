@@ -37,6 +37,7 @@ idf_component_register(
         esp_psram
         esp_mm
         esp_http_server
+        esp_event
         json
     EMBED_FILES
         "web/index.html.gz"
