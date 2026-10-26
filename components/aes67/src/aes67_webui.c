@@ -276,9 +276,7 @@ static bool json_sources_array(jbuf_t *jb, struct aes67_webui *ctx)
             continue;
         }
         aes67_rtp_stream_status_t rtp_st = {0};
-        if (src->rtp_stream) {
-            aes67_rtp_stream_get_status(src->rtp_stream, &rtp_st);
-        }
+        aes67_session_get_source_status(sess, i, &rtp_st);
         size_t mark = jb_mark(jb);
         bool ok = jb_printf(jb, "%s{\"id\":%u,\"name\":", first ? "" : ",", src->id)
                && jb_quoted(jb, src->name)
@@ -315,9 +313,7 @@ static bool json_sinks_array(jbuf_t *jb, struct aes67_webui *ctx)
             continue;
         }
         aes67_rtp_stream_status_t rtp_st = {0};
-        if (sink->rtp_stream) {
-            aes67_rtp_stream_get_status(sink->rtp_stream, &rtp_st);
-        }
+        aes67_session_get_sink_status(sess, i, &rtp_st);
         /* The Ethernet hook intercepts RTP at L2 before the engine sees
          * packets, so its counters are the ones that move (defined in the
          * example's main.c for now). */

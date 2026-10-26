@@ -146,14 +146,8 @@ static void audio_frame_task(void *arg)
             uint32_t need = spp * node->config.audio.channels * sizeof(int32_t);
             size_t got = xStreamBufferReceive(cap_buf, cap_samples, need, 0);
             if (got >= need) {
-                /* Write captured audio to all active source streams */
-                for (int i = 0; i < CONFIG_AES67_MAX_SOURCES; i++) {
-                    aes67_source_t src;
-                    if (aes67_session_get_source(node->session, i, &src) == ESP_OK &&
-                        src.enabled && src.rtp_stream) {
-                        aes67_rtp_source_write(src.rtp_stream, cap_samples, spp);
-                    }
-                }
+                /* Fan out to every active source under the engine lock */
+                aes67_rtp_engine_feed_capture(node->rtp, cap_samples, spp);
             }
         }
 

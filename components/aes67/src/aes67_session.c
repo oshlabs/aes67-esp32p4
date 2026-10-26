@@ -495,6 +495,42 @@ esp_err_t aes67_session_remove_sink(aes67_session_handle_t handle, uint8_t id)
     return ESP_OK;
 }
 
+esp_err_t aes67_session_get_source_status(aes67_session_handle_t handle, uint8_t id,
+                                          aes67_rtp_stream_status_t *status)
+{
+    if (!handle || !status || id >= CONFIG_AES67_MAX_SOURCES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    struct aes67_session_mgr *mgr = handle;
+    if (xSemaphoreTake(mgr->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    if (mgr->sources[id].enabled && mgr->sources[id].rtp_stream) {
+        ret = aes67_rtp_stream_get_status(mgr->sources[id].rtp_stream, status);
+    }
+    xSemaphoreGive(mgr->lock);
+    return ret;
+}
+
+esp_err_t aes67_session_get_sink_status(aes67_session_handle_t handle, uint8_t id,
+                                        aes67_rtp_stream_status_t *status)
+{
+    if (!handle || !status || id >= CONFIG_AES67_MAX_SINKS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    struct aes67_session_mgr *mgr = handle;
+    if (xSemaphoreTake(mgr->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    if (mgr->sinks[id].enabled && mgr->sinks[id].rtp_stream) {
+        ret = aes67_rtp_stream_get_status(mgr->sinks[id].rtp_stream, status);
+    }
+    xSemaphoreGive(mgr->lock);
+    return ret;
+}
+
 esp_err_t aes67_session_get_source(aes67_session_handle_t handle, uint8_t id,
                                    aes67_source_t *source)
 {

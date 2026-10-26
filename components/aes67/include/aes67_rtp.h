@@ -153,6 +153,15 @@ esp_err_t aes67_rtp_sink_read(aes67_rtp_stream_handle_t stream,
                               void *samples, uint32_t frame_count);
 
 /**
+ * Write captured audio (interleaved int32, frame_count frames) into every
+ * active source stream's ring buffer, under the engine's stream lock.
+ * This is the way the capture path feeds sources; it never holds a stream
+ * handle across a possible removal.
+ */
+esp_err_t aes67_rtp_engine_feed_capture(aes67_rtp_engine_handle_t handle,
+                                        const int32_t *samples, uint32_t frame_count);
+
+/**
  * Called by the audio frame timer (TIC) to trigger RTP packet transmission
  * for all active source streams.
  */

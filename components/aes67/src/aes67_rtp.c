@@ -79,6 +79,11 @@ struct aes67_rtp_stream {
 
 /* Internal engine structure */
 struct aes67_rtp_engine {
+    /* streams[] is read by the TIC task (process_tx, feed_capture) and the
+     * RX task, and mutated by add/remove from the httpd or SAP tasks, on
+     * both cores. Every access to the table or to a stream reached through
+     * it holds this mutex. Hold times are one tick's worth of work. */
+    SemaphoreHandle_t lock;
     struct aes67_rtp_stream *streams[AES67_MAX_STREAMS];
     int stream_count;
     int rx_sock;
@@ -171,6 +176,18 @@ static uint32_t ringbuf_read(aes67_ringbuf_t *rb, uint8_t *data, uint32_t len)
 }
 
 /* --- RTP header construction/parsing --- */
+
+/* --- Stream table lock --- */
+
+static inline void engine_lock(struct aes67_rtp_engine *engine)
+{
+    xSemaphoreTake(engine->lock, portMAX_DELAY);
+}
+
+static inline void engine_unlock(struct aes67_rtp_engine *engine)
+{
+    xSemaphoreGive(engine->lock);
+}
 
 static void rtp_build_header(uint8_t *buf, uint8_t pt, uint16_t seq,
                              uint32_t timestamp, uint32_t ssrc)
@@ -479,6 +496,11 @@ static void rx_task_func(void *arg)
         drain_pass = 1;
         last_pkt_time_us = esp_timer_get_time();
 
+        /* Everything below touches the stream table and a stream found in
+         * it; a 'continue' inside the do-while(0) leaves the block and
+         * releases the lock. */
+        engine_lock(engine);
+        do {
         if (recv_len < AES67_RTP_HEADER_SIZE) {
             continue;
         }
@@ -601,6 +623,8 @@ static void rx_task_func(void *arg)
                      codec_str, (unsigned long)stream->config.sample_rate,
                      channels, (unsigned long)payload_len, frames);
         }
+        } while (0);
+        engine_unlock(engine);
     }
 
     heap_caps_free(sample_buf);
@@ -631,6 +655,13 @@ esp_err_t aes67_rtp_engine_init(const aes67_net_config_t *net_config,
     engine->rx_sock = -1;
     engine->rx_task = NULL;
     engine->stream_count = 0;
+
+    engine->lock = xSemaphoreCreateMutex();
+    if (!engine->lock) {
+        ESP_LOGE(TAG, "Failed to create stream table lock");
+        free(engine);
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Stream buffer: sized for practical worst-case, not theoretical max.
      * AES67 mandates max 8 channels, max 4ms packet time at 48kHz = 192 frames.
@@ -806,6 +837,7 @@ esp_err_t aes67_rtp_engine_destroy(aes67_rtp_engine_handle_t handle)
         engine->rx_sock = -1;
     }
 
+    vSemaphoreDelete(engine->lock);
     free(engine);
     ESP_LOGI(TAG, "Engine destroyed");
     return ESP_OK;
@@ -821,6 +853,8 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
 
     struct aes67_rtp_engine *engine = engine_handle;
 
+    engine_lock(engine);
+
     /* Find a free slot */
     int slot = -1;
     for (int i = 0; i < AES67_MAX_STREAMS; i++) {
@@ -830,12 +864,14 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
         }
     }
     if (slot < 0) {
+        engine_unlock(engine);
         ESP_LOGE(TAG, "Maximum number of streams reached (%d)", AES67_MAX_STREAMS);
         return ESP_ERR_NO_MEM;
     }
 
     struct aes67_rtp_stream *s = calloc(1, sizeof(*s));
     if (!s) {
+        engine_unlock(engine);
         return ESP_ERR_NO_MEM;
     }
 
@@ -871,6 +907,7 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
     esp_err_t err = stream_alloc_buffers(s, engine->use_psram);
     if (err != ESP_OK) {
         free(s);
+        engine_unlock(engine);
         return err;
     }
 
@@ -888,6 +925,7 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
                      config->src_port);
             stream_free_buffers(s);
             free(s);
+            engine_unlock(engine);
             return ESP_FAIL;
         }
 
@@ -917,6 +955,7 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
     engine->streams[slot] = s;
     engine->stream_count++;
     *stream = s;
+    engine_unlock(engine);
 
     char ip_str[16];
     aes67_net_u32_to_ip(config->dest_ip, ip_str, sizeof(ip_str));
@@ -939,7 +978,10 @@ esp_err_t aes67_rtp_stream_remove(aes67_rtp_engine_handle_t engine_handle,
     struct aes67_rtp_engine *engine = engine_handle;
     struct aes67_rtp_stream *s = stream;
 
-    /* Find and clear the slot */
+    /* Unlink under the lock. Once the slot is clear and the lock released,
+     * neither the TIC nor the RX task can reach s any more, so the rest of
+     * the teardown runs without holding up the audio paths. */
+    engine_lock(engine);
     int slot = -1;
     for (int i = 0; i < AES67_MAX_STREAMS; i++) {
         if (engine->streams[i] == s) {
@@ -948,11 +990,14 @@ esp_err_t aes67_rtp_stream_remove(aes67_rtp_engine_handle_t engine_handle,
             break;
         }
     }
+    if (slot >= 0) {
+        s->active = false;
+        engine->stream_count--;
+    }
+    engine_unlock(engine);
     if (slot < 0) {
         return ESP_ERR_NOT_FOUND;
     }
-
-    s->active = false;
 
     /* Leave multicast group for sink streams */
     if (s->direction == AES67_STREAM_SINK &&
@@ -969,7 +1014,6 @@ esp_err_t aes67_rtp_stream_remove(aes67_rtp_engine_handle_t engine_handle,
     }
 
     stream_free_buffers(s);
-    engine->stream_count--;
 
     ESP_LOGI(TAG, "Removed stream [%d]", slot);
     free(s);
@@ -1010,6 +1054,30 @@ esp_err_t aes67_rtp_source_write(aes67_rtp_stream_handle_t stream,
         return ESP_ERR_NO_MEM;
     }
 
+    return ESP_OK;
+}
+
+esp_err_t aes67_rtp_engine_feed_capture(aes67_rtp_engine_handle_t handle,
+                                        const int32_t *samples, uint32_t frame_count)
+{
+    if (!handle || !samples) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    struct aes67_rtp_engine *engine = handle;
+
+    engine_lock(engine);
+    for (int i = 0; i < AES67_MAX_STREAMS; i++) {
+        struct aes67_rtp_stream *s = engine->streams[i];
+        if (!s || s->direction != AES67_STREAM_SOURCE || !s->active) {
+            continue;
+        }
+        uint32_t byte_count = frame_count * s->config.channels * sizeof(int32_t);
+        uint32_t written = ringbuf_write(&s->ring, (const uint8_t *)samples, byte_count);
+        if (written < byte_count) {
+            s->status.status_flags |= AES67_RTP_STATUS_OVERFLOW;
+        }
+    }
+    engine_unlock(engine);
     return ESP_OK;
 }
 
@@ -1073,6 +1141,7 @@ esp_err_t aes67_rtp_engine_process_tx(aes67_rtp_engine_handle_t handle,
         return ESP_ERR_INVALID_STATE;
     }
 
+    engine_lock(engine);
     for (int i = 0; i < AES67_MAX_STREAMS; i++) {
         struct aes67_rtp_stream *s = engine->streams[i];
         if (!s || s->direction != AES67_STREAM_SOURCE || !s->active) {
@@ -1201,6 +1270,7 @@ esp_err_t aes67_rtp_engine_process_tx(aes67_rtp_engine_handle_t handle,
             s->status.status_flags &= ~AES67_RTP_STATUS_UNDERFLOW;
         }
     }
+    engine_unlock(engine);
 
     return ESP_OK;
 }

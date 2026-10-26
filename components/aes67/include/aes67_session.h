@@ -116,6 +116,20 @@ esp_err_t aes67_session_get_sink(aes67_session_handle_t handle, uint8_t id,
                                  aes67_sink_t *sink);
 
 /**
+ * Copy a source's RTP stream status under the session lock, so the stream
+ * cannot be removed while it is read. Use this instead of calling
+ * aes67_rtp_stream_get_status() on the handle in a copied descriptor.
+ */
+esp_err_t aes67_session_get_source_status(aes67_session_handle_t handle, uint8_t id,
+                                          aes67_rtp_stream_status_t *status);
+
+/**
+ * Same for a sink.
+ */
+esp_err_t aes67_session_get_sink_status(aes67_session_handle_t handle, uint8_t id,
+                                        aes67_rtp_stream_status_t *status);
+
+/**
  * Get the number of active sources.
  */
 int aes67_session_get_source_count(aes67_session_handle_t handle);
