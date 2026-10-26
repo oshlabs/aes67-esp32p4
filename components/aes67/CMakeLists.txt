@@ -39,9 +39,22 @@ idf_component_register(
         esp_http_server
         esp_event
         json
-    EMBED_FILES
-        "web/index.html.gz"
 )
+
+# The web page is embedded gzipped. Generate the archive in the build
+# directory from web/index.html, so it is never stale and never tracked.
+set(AES67_WEB_GZ "${CMAKE_CURRENT_BINARY_DIR}/index.html.gz")
+add_custom_command(
+    OUTPUT "${AES67_WEB_GZ}"
+    COMMAND gzip -9 -n -c "${CMAKE_CURRENT_SOURCE_DIR}/web/index.html" > "${AES67_WEB_GZ}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/index.html"
+    COMMENT "Compressing web/index.html"
+    VERBATIM
+)
+add_custom_target(aes67_web_gz DEPENDS "${AES67_WEB_GZ}")
+add_dependencies(${COMPONENT_LIB} aes67_web_gz)
+set_property(SOURCE "${AES67_WEB_GZ}" PROPERTY GENERATED TRUE)
+target_add_binary_data(${COMPONENT_LIB} "${AES67_WEB_GZ}" BINARY)
 
 # ptpd.c is a third-party port with intentionally-unused helpers behind
 # Kconfig; silence that one warning for the bundled file only.
@@ -50,10 +63,3 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-function"
 )
 
-# Gzip the web frontend for embedding in flash
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/web/index.html.gz
-    COMMAND gzip -9 -k -f ${CMAKE_CURRENT_SOURCE_DIR}/web/index.html
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/web/index.html
-    COMMENT "Compressing web/index.html -> index.html.gz"
-)
