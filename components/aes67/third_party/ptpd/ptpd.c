@@ -167,6 +167,7 @@ struct ptp_state_s
   int64_t local_time_ns_prev;
 
   int64_t last_offset_ns;
+  int stability_count;        /* consecutive syncs with a stable offset */
 
   pi_cntrl_t offset_pi;
 #endif // ESP_PTP
@@ -1418,6 +1419,9 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   /* Compute clock offset against master */
   int64_t offset_ns = timespec_delta_ns(remote_timestamp, local_timestamp);
   offset_ns += state->path_delay_ns;
+  /* Previous sample's offset, for the stability gate below; the outlier
+   * filter overwrites last_offset_ns before we get there. */
+  int64_t prev_offset_ns = state->last_offset_ns;
 
   /* Outlier filter: reject measurements where the offset changes by
    * more than 2ms from the previous sample. These are caused by network
@@ -1523,19 +1527,17 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
 
   // Get the path delay only when clock is stable enough. If we were in process of adjustion (speeding/slowing slave),
   // we would get incorrect delay
-  int64_t diff = llabs(offset_ns) - llabs(state->last_offset_ns);
-  static int cnt = 0;
-  if (llabs(diff) < CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS) {
-    if (cnt <= 3)
-      cnt++;
+  int64_t diff = llabs(offset_ns) - llabs(prev_offset_ns);
+  if (prev_offset_ns != 0 && llabs(diff) < CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS) {
+    if (state->stability_count <= 3)
+      state->stability_count++;
   } else {
-    cnt = 0;
+    state->stability_count = 0;
   }
-  if (cnt > 3)
+  if (state->stability_count > 3)
   {
     state->can_send_delayreq = true;
   }
-  state->last_offset_ns = offset_ns;
 }
 
 void ptp_clean_after_step(FAR struct ptp_state_s *state)
@@ -1545,6 +1547,7 @@ void ptp_clean_after_step(FAR struct ptp_state_s *state)
 
   state->offset_pi.drift_acc = 0;
   state->last_offset_ns = 0;
+  state->stability_count = 0;
 }
 #endif // ESP_PTP
 

@@ -22,3 +22,6 @@ re-synced against a newer upstream:
 - `is_better_clock()`: compares the announce data set lexicographically
   (priority1, class, accuracy, variance, priority2, identity) instead of
   returning true when any single field is lower.
+- `ptp_lock_local_clock_freq()`: the path-delay stability gate compares
+  against the previous sample (it compared the offset with itself), the
+  counter lives in the state and is reset after a clock step.
