@@ -44,6 +44,12 @@ esp_err_t aes67_hw_timer_init(uint32_t frame_period_ns,
 esp_err_t aes67_hw_timer_start(void);
 
 /**
+ * Re-anchor the timer to the next frame boundary from the current PTP
+ * time. Call when ticks stop arriving (e.g. after a backward PTP step).
+ */
+esp_err_t aes67_hw_timer_rearm(void);
+
+/**
  * Stop the hardware frame timer.
  */
 esp_err_t aes67_hw_timer_stop(void);

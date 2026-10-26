@@ -136,6 +136,32 @@ esp_err_t aes67_hw_timer_start(void)
     return ESP_OK;
 }
 
+esp_err_t aes67_hw_timer_rearm(void)
+{
+    if (!s_timer.running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Re-anchor to the next frame boundary from the current PTP time.
+     * Used when the TIC stops receiving ticks, e.g. after a backward PTP
+     * step left the programmed target far in the future. */
+    struct timespec now;
+    if (esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &now) != 0) {
+        return ESP_FAIL;
+    }
+    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+    uint64_t period = s_timer.frame_period_ns;
+    uint64_t next_ns = ((now_ns / period) + 1) * period;
+
+    s_timer.next_time.tv_sec = (time_t)(next_ns / 1000000000ULL);
+    s_timer.next_time.tv_nsec = (long)(next_ns % 1000000000ULL);
+    esp_eth_clock_set_target_time(CLOCK_PTP_SYSTEM, &s_timer.next_time);
+
+    ESP_LOGW(TAG, "re-armed (target: %lld.%09ld)",
+             (long long)s_timer.next_time.tv_sec, s_timer.next_time.tv_nsec);
+    return ESP_OK;
+}
+
 esp_err_t aes67_hw_timer_stop(void)
 {
     s_timer.running = false;

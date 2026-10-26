@@ -108,11 +108,28 @@ static void audio_frame_task(void *arg)
     ESP_LOGI(TAG, "Audio frame task started (hw-timed TX%s)",
              cap_buf ? "+capture" : "");
 
+    uint32_t missed_waits = 0;
+
     while (node->running) {
         /* Wait for the hardware PTP frame timer ISR */
         if (xSemaphoreTake(s_frame_sem, pdMS_TO_TICKS(10)) != pdTRUE) {
+            /* No tick for 10 ms (>= 2 periods at 4 ms ptime). After a
+             * backward PTP step the programmed target time can sit far
+             * in the future and the ISR never fires again; re-anchor it. */
+            if (++missed_waits >= 5) {
+                missed_waits = 0;
+                if (aes67_hw_timer_rearm() == ESP_OK && cap_buf && cap_samples) {
+                    /* Drop the audio that piled up while stalled so the
+                     * stream does not carry a permanent extra delay. */
+                    uint32_t need = spp * node->config.audio.channels * sizeof(int32_t);
+                    while (xStreamBufferBytesAvailable(cap_buf) > 2 * need) {
+                        xStreamBufferReceive(cap_buf, cap_samples, need, 0);
+                    }
+                }
+            }
             continue;
         }
+        missed_waits = 0;
 
         frame_count++;
 
