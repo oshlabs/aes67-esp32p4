@@ -589,3 +589,8 @@ esp_err_t aes67_ptp_get_grandmaster_str(aes67_ptp_handle_t handle, char *buf, si
 
     return ESP_OK;
 }
+
+bool aes67_ptp_eth_input(const uint8_t *frame, uint32_t len, const void *info)
+{
+    return ptpd_hook_input(frame, len, info) == 1;
+}

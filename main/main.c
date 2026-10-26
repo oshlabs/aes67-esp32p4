@@ -43,6 +43,7 @@
 #include "aes67_session.h"
 #include "aes67_rtp.h"
 #include "aes67_sap.h"
+#include "aes67_ptp.h"
 #include "aes67_audio.h"
 #include "dsps_tone_gen.h"
 #include "driver/i2c.h"
@@ -204,6 +205,12 @@ static esp_err_t IRAM_ATTR eth_rtp_hook(esp_eth_handle_t eth_handle,
                                           void *priv, void *info)
 {
     s_hook_total_frames++;
+
+    /* PTP over UDP goes to the daemon with its hardware receive timestamp */
+    if (aes67_ptp_eth_input(buffer, length, info)) {
+        free(buffer);
+        return ESP_OK;
+    }
 
     /* Quick reject: minimum Ethernet+IP+UDP+RTP header = 54 bytes */
     if (length < 54 || !s_hook_tx_chan) goto forward;

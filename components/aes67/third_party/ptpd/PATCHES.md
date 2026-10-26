@@ -25,3 +25,11 @@ re-synced against a newer upstream:
 - `ptp_lock_local_clock_freq()`: the path-delay stability gate compares
   against the previous sample (it compared the offset with itself), the
   counter lives in the state and is reset after a clock step.
+- UDP transport quality: `ptpd_hook_input()` lets the Ethernet input hook hand
+  PTP/UDP multicast frames to the daemon with the EMAC's receive timestamp;
+  the daemon loop waits on that queue. Delay requests go out on the transport
+  the selected master uses, as a raw frame through the driver when that is
+  UDP, so the hardware transmit stamp belongs to the frame the master sees.
+  Sync/follow-up are sent per transport with each transport's own stamp.
+  `IP_MULTICAST_LOOP` is off on the transmit socket. The daemon task runs at
+  `CONFIG_NETUTILS_PTPD_SERVERPRIO` instead of idle+2.

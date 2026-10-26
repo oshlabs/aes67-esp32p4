@@ -111,6 +111,15 @@ esp_err_t aes67_ptp_register_lock_cb(aes67_ptp_handle_t handle,
                                      aes67_ptp_lock_cb_t cb, void *user_data);
 
 /**
+ * Offer a received Ethernet frame to the PTP daemon. Call this first from
+ * the Ethernet input hook with the driver's `info` argument (the hardware
+ * receive timestamp). Returns true when the frame was consumed: free it and
+ * do not forward it. PTP over UDP then gets hardware receive timestamps
+ * like PTP over Ethernet already has.
+ */
+bool aes67_ptp_eth_input(const uint8_t *frame, uint32_t len, const void *info);
+
+/**
  * Get the grand master ID formatted as a string (e.g. "00-1A-2B-FF-FE-3C-4D-5E").
  */
 esp_err_t aes67_ptp_get_grandmaster_str(aes67_ptp_handle_t handle, char *buf, size_t len);

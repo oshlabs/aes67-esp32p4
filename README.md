@@ -32,7 +32,10 @@ An ESP-IDF component implementing the AES67 (and RAVENNA-compatible) audio-over-
 
 ## Features
 
-- **PTP (IEEE 1588v2)** clock synchronization using ESP32-P4 EMAC hardware timestamping
+- **PTP (IEEE 1588v2)** clock synchronization using ESP32-P4 EMAC hardware timestamping,
+  on receive for both PTP over Ethernet and PTP over UDP/IPv4 (the Ethernet input hook
+  hands UDP PTP frames to the daemon with the driver's timestamp), and on transmit for
+  delay requests on either transport
   - Slave mode: synchronizes to an external PTP grandmaster
   - Grandmaster mode: becomes PTP GM when no other master is present
   - PI controller with adaptive gain for fast lock and stable tracking

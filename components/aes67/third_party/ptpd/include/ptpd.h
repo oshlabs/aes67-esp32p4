@@ -186,6 +186,22 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status);
 
 int ptpd_stop(int pid);
 
+/****************************************************************************
+ * Name: ptpd_hook_input
+ *
+ * Description:
+ *   Offer a received Ethernet frame, with the driver's hardware receive
+ *   timestamp (eth_mac_time_t *, may be NULL), to the daemon. PTP/UDP
+ *   frames to 224.0.1.129 are queued for processing with that timestamp.
+ *
+ * Returned Value:
+ *   1 if the frame was consumed (caller must free it and not forward it),
+ *   0 if the daemon is not interested (forward as usual).
+ *
+ ****************************************************************************/
+
+int ptpd_hook_input(const uint8_t *frame, size_t len, const void *mac_ts);
+
 #undef EXTERN
 #ifdef __cplusplus
 }

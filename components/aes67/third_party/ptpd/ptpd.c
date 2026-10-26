@@ -80,6 +80,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_err.h"
 #include "lwip/prot/ethernet.h" // Ethernet headers
 
@@ -264,6 +265,7 @@ struct ptp_state_s
 
 #ifdef CONFIG_NETUTILS_PTPD_SERVER
 #  define PTPD_POLL_INTERVAL CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MSEC
+#  define PTPD_HOOK_WAIT_MS   10   /* loop period when the Ethernet hook feeds the daemon */
 #else
 #  define PTPD_POLL_INTERVAL CONFIG_NETUTILS_PTPD_TIMEOUT_MS
 #endif
@@ -313,6 +315,147 @@ static void ptp_create_eth_frame(struct ptp_state_s *state, uint8_t *eth_frame, 
 
   memcpy(eth_frame, &eth_hdr, sizeof(eth_hdr));
   memcpy(eth_frame + sizeof(eth_hdr), ptp_msg, ptp_msg_len);
+}
+
+/* --- UDP/IPv4 PTP through the Ethernet input hook ---------------------------
+ *
+ * Hardware receive timestamps are available to whoever sees the frame in the
+ * driver's input path, before lwIP. The application's Ethernet hook calls
+ * ptpd_hook_input() for every frame; PTP/UDP multicast frames are copied
+ * into a queue together with their timestamp and consumed there, so the
+ * daemon's UDP sockets never see them (they remain for IGMP membership and
+ * unicast replies). */
+
+#define PTP_HOOK_QUEUE_LEN   16
+#define PTP_HOOK_MAX_MSG     256
+
+typedef struct
+{
+  uint16_t len;
+  uint16_t port;
+  struct timespec ts;
+  uint8_t data[PTP_HOOK_MAX_MSG];
+} ptp_hook_item_t;
+
+static QueueHandle_t s_hook_queue = NULL;
+
+int ptpd_hook_input(const uint8_t *frame, size_t len, const void *mac_ts)
+{
+  QueueHandle_t q = s_hook_queue;
+  if (!q || len < 14 + 20 + 8 + 34)
+    {
+      return 0;
+    }
+  if (frame[12] != 0x08 || frame[13] != 0x00)          /* IPv4 */
+    {
+      return 0;
+    }
+  const uint8_t *ip = frame + 14;
+  size_t ihl = (ip[0] & 0x0F) * 4;
+  if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17)   /* UDP */
+    {
+      return 0;
+    }
+  if (!(ip[16] == 224 && ip[17] == 0 && ip[18] == 1 && ip[19] == 129))
+    {
+      return 0;                                         /* only the PTP group */
+    }
+  const uint8_t *udp = ip + ihl;
+  uint16_t dport = (uint16_t)((udp[2] << 8) | udp[3]);
+  if (dport != PTP_UDP_PORT_EVENT && dport != PTP_UDP_PORT_INFO)
+    {
+      return 0;
+    }
+  size_t udp_len = (size_t)((udp[4] << 8) | udp[5]);
+  if (udp_len < 8 + 34 || 14 + ihl + udp_len > len)
+    {
+      return 0;
+    }
+  ptp_hook_item_t item;
+  item.len = (uint16_t)(udp_len - 8 > PTP_HOOK_MAX_MSG ? PTP_HOOK_MAX_MSG : udp_len - 8);
+  item.port = dport;
+  if (mac_ts)
+    {
+      const eth_mac_time_t *t = (const eth_mac_time_t *)mac_ts;
+      item.ts.tv_sec = t->seconds;
+      item.ts.tv_nsec = t->nanoseconds;
+    }
+  else
+    {
+      esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &item.ts);
+    }
+  memcpy(item.data, udp + 8, item.len);
+  /* Queue full: leave the frame to lwIP so the socket path handles it */
+  return xQueueSend(q, &item, 0) == pdTRUE ? 1 : 0;
+}
+
+static uint16_t ip_checksum(const uint8_t *data, size_t len)
+{
+  uint32_t sum = 0;
+  for (size_t i = 0; i + 1 < len; i += 2)
+    {
+      sum += (uint32_t)((data[i] << 8) | data[i + 1]);
+    }
+  if (len & 1)
+    {
+      sum += (uint32_t)(data[len - 1] << 8);
+    }
+  while (sum >> 16)
+    {
+      sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+  return (uint16_t)~sum;
+}
+
+/* Send a PTP message as a raw Ethernet/IPv4/UDP frame to the PTP multicast
+ * group through the driver, so the hardware transmit timestamp of this very
+ * frame comes back in *ts. */
+static int ptp_send_udp_raw(FAR struct ptp_state_s *state, const void *msg,
+                            uint16_t msg_len, uint16_t port, struct timespec *ts)
+{
+  if (msg_len > PTP_HOOK_MAX_MSG || !state->cached_eth_handle)
+    {
+      return -1;
+    }
+  uint8_t frame[14 + 20 + 8 + PTP_HOOK_MAX_MSG];
+  uint8_t *eth = frame, *ip = frame + 14, *udp = ip + 20, *pl = udp + 8;
+  static const uint8_t dst_mac[6] = {0x01, 0x00, 0x5E, 0x00, 0x01, 0x81};
+  memcpy(eth, dst_mac, 6);
+  memcpy(eth + 6, state->intf_hw_addr, 6);
+  eth[12] = 0x08; eth[13] = 0x00;
+
+  uint16_t ip_len = (uint16_t)(20 + 8 + msg_len);
+  memset(ip, 0, 20);
+  ip[0] = 0x45;
+  ip[1] = 0xB8;                               /* DSCP 46 (EF), as the sockets use */
+  ip[2] = ip_len >> 8; ip[3] = ip_len & 0xFF;
+  ip[6] = 0x40;                               /* DF */
+  ip[8] = 1;                                  /* TTL 1: PTP stays on the link */
+  ip[9] = 17;
+  memcpy(ip + 12, &state->interface_addr.sin_addr.s_addr, 4);
+  ip[16] = 224; ip[17] = 0; ip[18] = 1; ip[19] = 129;
+  uint16_t csum = ip_checksum(ip, 20);
+  ip[10] = csum >> 8; ip[11] = csum & 0xFF;
+
+  uint16_t udp_len = (uint16_t)(8 + msg_len);
+  udp[0] = port >> 8; udp[1] = port & 0xFF;
+  udp[2] = port >> 8; udp[3] = port & 0xFF;
+  udp[4] = udp_len >> 8; udp[5] = udp_len & 0xFF;
+  udp[6] = 0; udp[7] = 0;                     /* UDP checksum optional on IPv4 */
+  memcpy(pl, msg, msg_len);
+
+  eth_mac_time_t mac_ts = {0};
+  size_t total = 14 + ip_len;
+  if (esp_eth_transmit_ctrl_vargs(state->cached_eth_handle, &mac_ts, 2, frame, total) != ESP_OK)
+    {
+      return -1;
+    }
+  if (ts)
+    {
+      ts->tv_sec = mac_ts.seconds;
+      ts->tv_nsec = mac_ts.nanoseconds;
+    }
+  return msg_len;
 }
 
 static int ptp_net_send(FAR struct ptp_state_s *state, void *ptp_msg, uint16_t ptp_msg_len, struct timespec *ts)
@@ -794,6 +937,12 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
     bind_addr.sin_port = 0;  /* Any port */
     bind(state->tx_socket, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
 
+    /* Our own announcements must not come back through lwIP */
+    {
+      int loop = 0;
+      setsockopt(state->tx_socket, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+    }
+
     /* Set multicast TTL */
     int ttl = 64;
     setsockopt(state->tx_socket, IPPROTO_IP, IP_MULTICAST_TTL,
@@ -802,6 +951,12 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
     ptpinfo("UDP PTP sockets ready (event:%d, info:%d, tx:%d)\n",
             state->event_socket, state->info_socket, state->tx_socket);
   }
+
+  s_hook_queue = xQueueCreate(PTP_HOOK_QUEUE_LEN, sizeof(ptp_hook_item_t));
+  if (!s_hook_queue)
+    {
+      ptperr("Failed to create hook queue\n");
+    }
 
   s_state = state;
   return OK;
@@ -963,6 +1118,14 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
 static int ptp_destroy_state(FAR struct ptp_state_s *state)
 {
 #ifdef ESP_PTP
+  /* Stop the hook from enqueuing, let an in-flight send finish, then free */
+  QueueHandle_t q = s_hook_queue;
+  s_hook_queue = NULL;
+  if (q)
+    {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      vQueueDelete(q);
+    }
   // Remove well-known PTP multicast destination MAC addresses from the filter
   esp_eth_handle_t eth_handle;
   if (ioctl(state->ptp_socket, L2TAP_G_DEVICE_DRV_HNDL, &eth_handle) < 0)
@@ -1180,17 +1343,15 @@ static int ptp_send_sync(FAR struct ptp_state_s *state)
   timespec_to_ptp_format(&ts, msg.origintimestamp);
 
 #ifdef ESP_PTP
+  /* One sync per transport, each with its own hardware transmit stamp, so
+   * the follow-up sent on a transport carries the stamp of the sync that
+   * actually went out there. */
+  struct timespec ts_udp = ts;
   ret = ptp_net_send(state, &msg, sizeof(msg), &ts);
-
-  /* Also send sync via UDP for AES67 interoperability */
-  {
-    struct sockaddr_in udp_addr;
-    udp_addr.sin_family      = AF_INET;
-    udp_addr.sin_addr.s_addr = htonl(PTP_MULTICAST_ADDR);
-    udp_addr.sin_port        = htons(PTP_UDP_PORT_EVENT);
-    sendto(state->tx_socket, &msg, sizeof(msg), 0,
-           (struct sockaddr *)&udp_addr, sizeof(udp_addr));
-  }
+  if (ptp_send_udp_raw(state, &msg, sizeof(msg), PTP_UDP_PORT_EVENT, &ts_udp) < 0)
+    {
+      ts_udp = ts;
+    }
 #else
   ret = sendmsg(state->tx_socket, &txhdr, 0);
 #endif // ESP_PTP
@@ -1215,15 +1376,9 @@ static int ptp_send_sync(FAR struct ptp_state_s *state)
 #ifdef ESP_PTP
   ret = ptp_net_send(state, &msg, sizeof(msg), NULL);
 
-  /* Also send follow-up via UDP */
-  {
-    struct sockaddr_in udp_addr;
-    udp_addr.sin_family      = AF_INET;
-    udp_addr.sin_addr.s_addr = htonl(PTP_MULTICAST_ADDR);
-    udp_addr.sin_port        = htons(PTP_UDP_PORT_INFO);
-    sendto(state->tx_socket, &msg, sizeof(msg), 0,
-           (struct sockaddr *)&udp_addr, sizeof(udp_addr));
-  }
+  /* UDP follow-up with the UDP sync's own transmit stamp */
+  timespec_to_ptp_format(&ts_udp, msg.origintimestamp);
+  ptp_send_udp_raw(state, &msg, sizeof(msg), PTP_UDP_PORT_INFO, NULL);
 #else
   addr.sin_port = htons(PTP_UDP_PORT_INFO);
 
@@ -1272,17 +1427,17 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state)
   timespec_to_ptp_format(&state->delayreq_time, req.origintimestamp);
 
 #ifdef ESP_PTP
-  ret = ptp_net_send(state, &req, sizeof(req), &state->delayreq_time);
-
-  /* Also send delay_req via UDP */
-  {
-    struct sockaddr_in udp_addr;
-    udp_addr.sin_family      = AF_INET;
-    udp_addr.sin_addr.s_addr = htonl(PTP_MULTICAST_ADDR);
-    udp_addr.sin_port        = htons(PTP_UDP_PORT_EVENT);
-    sendto(state->tx_socket, &req, sizeof(req), 0,
-           (struct sockaddr *)&udp_addr, sizeof(udp_addr));
-  }
+  /* Send on the transport the selected master speaks; the master answers
+   * the frame it saw, so that frame's hardware stamp is the one to keep. */
+  if (state->source_transport == 2)
+    {
+      ret = ptp_send_udp_raw(state, &req, sizeof(req), PTP_UDP_PORT_EVENT,
+                             &state->delayreq_time);
+    }
+  else
+    {
+      ret = ptp_net_send(state, &req, sizeof(req), &state->delayreq_time);
+    }
 #else
   ret = sendto(state->tx_socket, &req, sizeof(req), 0,
                (FAR struct sockaddr *)&addr, sizeof(addr));
@@ -2218,7 +2373,29 @@ static int ptp_daemon(int argc, FAR char** argv)
       pollfds[1].revents = 0;
 #ifdef ESP_PTP
       pollfds[2].revents = 0;
-      ret = poll(pollfds, 3, PTPD_POLL_INTERVAL);
+
+      /* Frames diverted by the Ethernet hook carry hardware receive
+       * stamps; wait on that queue, then poll the descriptors briefly. */
+      if (s_hook_queue)
+        {
+          ptp_hook_item_t item;
+          while (xQueueReceive(s_hook_queue, &item, pdMS_TO_TICKS(PTPD_HOOK_WAIT_MS)) == pdTRUE)
+            {
+              state->rx_transport = 2;
+              state->rxtime = item.ts;
+              memcpy(&state->rxbuf, item.data, item.len);
+              ptp_process_rx_packet(state, item.len);
+              if (uxQueueMessagesWaiting(s_hook_queue) == 0)
+                {
+                  break;
+                }
+            }
+          ret = poll(pollfds, 3, 0);
+        }
+      else
+        {
+          ret = poll(pollfds, 3, PTPD_POLL_INTERVAL);
+        }
 #else
       ret = poll(pollfds, 2, PTPD_POLL_INTERVAL);
 #endif
@@ -2359,7 +2536,7 @@ int ptpd_start(FAR const char *interface)
       s_init_done = xSemaphoreCreateBinary();
     }
   if (xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
-                  (void *)interface, tskIDLE_PRIORITY + 2, NULL) != pdPASS)
+                  (void *)interface, CONFIG_NETUTILS_PTPD_SERVERPRIO, NULL) != pdPASS)
     {
       return -ENOMEM;
     }
