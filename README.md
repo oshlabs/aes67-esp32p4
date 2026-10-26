@@ -44,12 +44,15 @@ An ESP-IDF component implementing the AES67 (and RAVENNA-compatible) audio-over-
 - **RTP audio streaming** with ISR-driven DMA playback
   - Source (TX) and Sink (RX) streams
   - L16, L24, L32, AM824 codec support with MTConvert function pointer dispatch
-  - Channels: 1-8 per stream with channel routing support
+  - Channels: 1-8 per stream on the wire; the I2S output is two slots, fed by
+    the sink's `routing[]` (defaults: channels 0 and 1; a mono stream feeds both)
   - Sample rates: 44.1kHz, 48kHz
   - Packet time: 0.125ms to 4ms (6 to 192 frames)
   - Handles 250 to 8000+ packets per second
   - DSCP/QoS marking for network prioritization
-  - Ethernet MAC hook for L2 RTP interception (bypasses lwIP entirely)
+  - Ethernet receive hook inside the component: RTP for active sinks and PTP over
+    UDP are taken off the driver's input path before lwIP, matched per sink on
+    group, port and payload type, locked to one SSRC, with per-sink statistics
   - IEEE 802.3x flow control prevents EMAC multicast frame drops
 - **ISR-driven playback** -- zero task scheduling overhead
   - DMA ISR reads directly from stream buffer at up to 3000Hz
@@ -245,8 +248,13 @@ cfg.audio_cb_user_data = NULL;
 
 ```
 Playback (ISR-driven, default):
-  Network -> Ethernet L2 hook -> convert L16/L24/L32 to int32
-          -> StreamBuffer -> DMA ISR (up to 3000Hz) -> I2S -> DAC
+  Network -> Ethernet receive hook (component) -> RTP engine: validate,
+          match sink, decode L16/L24/L32 to int32, route to 2 slots
+          -> audio driver playout StreamBuffer -> DMA ISR (up to 3000Hz)
+          -> I2S -> DAC
+
+  In callback / stream-buffer output modes the engine's own buffer feeds
+  the playback task instead of the DMA ISR.
 
   The DMA ISR fires when a descriptor finishes playing, reads from
   the stream buffer, and fills the next descriptor. Two descriptors
@@ -262,7 +270,7 @@ Timing:
 
 ## Key Design Decisions
 
-- **Ethernet L2 hook** intercepts RTP packets before lwIP, avoiding all TCP/IP stack overhead
+- **Ethernet receive hook** (in the component, installed by the node) intercepts RTP and UDP PTP before lwIP, avoiding all TCP/IP stack overhead; disable with `config.eth_rx_hook = false` to use the socket path
 - **ISR-driven playback** eliminates task scheduling jitter that caused 10% throughput loss with task-based approach
 - **IEEE 802.3x flow control** prevents the ESP32-P4 EMAC from dropping multicast frames under load (8% loss without it)
 - **Sample-hold on underrun** produces smooth decay instead of audible silence clicks
