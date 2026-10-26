@@ -56,6 +56,15 @@ menu "AES67 Example"
         range 0 100
         default 70
 
+    config EXAMPLE_RESTART_TEST_CYCLES
+        int "Lifecycle test: stop/start the node N times at boot (0 = off)"
+        default 0
+        range 0 1000
+        help
+            Development aid. After the node is up, stop and start it this many
+            times, logging free heap and checking heap integrity after each
+            cycle. Exercises the task joins and the per-module stop paths.
+
     config EXAMPLE_CREATE_MIC_SOURCE
         bool "Create a microphone source stream at boot"
         default y

@@ -22,6 +22,10 @@
 #include "freertos/event_groups.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
+#if CONFIG_HEAP_TRACING_STANDALONE
+#include "esp_heap_trace.h"
+#endif
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -767,6 +771,50 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "node ready");
+
+#if CONFIG_EXAMPLE_RESTART_TEST_CYCLES > 0
+    /* Lifecycle test: stop and start the node repeatedly. With
+     * CONFIG_HEAP_TRACING_STANDALONE the allocations that survive the
+     * last cycle are dumped with their call stacks. */
+    {
+#if CONFIG_HEAP_TRACING_STANDALONE
+        static heap_trace_record_t s_trace[200];
+        heap_trace_init_standalone(s_trace, 200);
+#endif
+        uint32_t heap_before = esp_get_free_heap_size();
+        for (int cycle = 1; cycle <= CONFIG_EXAMPLE_RESTART_TEST_CYCLES; cycle++) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+#if CONFIG_HEAP_TRACING_STANDALONE
+            if (cycle == CONFIG_EXAMPLE_RESTART_TEST_CYCLES) {
+                heap_trace_start(HEAP_TRACE_LEAKS);
+            }
+#endif
+            int64_t t0 = esp_timer_get_time();
+            esp_err_t e1 = aes67_node_stop(node);
+            int64_t t1 = esp_timer_get_time();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_err_t e2 = aes67_node_start(node);
+            int64_t t2 = esp_timer_get_time();
+            bool ok = heap_caps_check_integrity_all(true);
+            ESP_LOGI(TAG, "lifecycle cycle %d: stop %s in %lld ms, start %s in %lld ms, "
+                     "heap free %lu (delta %+ld), integrity %s",
+                     cycle, esp_err_to_name(e1), (long long)((t1 - t0) / 1000),
+                     esp_err_to_name(e2), (long long)((t2 - t1 - 500000) / 1000),
+                     (unsigned long)esp_get_free_heap_size(),
+                     (long)((int32_t)esp_get_free_heap_size() - (int32_t)heap_before),
+                     ok ? "ok" : "CORRUPT");
+        }
+#if CONFIG_HEAP_TRACING_STANDALONE
+        /* Stop once more so the dump shows only what a full stop/start/stop
+         * left behind, then bring the node back up. */
+        aes67_node_stop(node);
+        heap_trace_stop();
+        heap_trace_dump();
+        aes67_node_start(node);
+#endif
+        ESP_LOGI(TAG, "lifecycle test done");
+    }
+#endif
 
     /* Monitor loop: ISR health only */
     extern void aes67_audio_log_isr_stats(void);
