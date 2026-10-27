@@ -1,5 +1,6 @@
 /*
  * SPDX-FileCopyrightText: 2026 DatanoiseTV
+ * SPDX-FileCopyrightText: 2026 Leon de Rooij (OSHLabs)
  *
  * SPDX-License-Identifier: Apache-2.0
  */
