@@ -551,6 +551,7 @@ esp_err_t aes67_sap_start(aes67_sap_handle_t handle)
 
     /* RFC 2974 requires SAP packets to have TTL=255 */
     aes67_net_set_multicast_ttl(handle->sock, 255);
+    aes67_net_set_multicast_if(handle->sock);
 
     /* Disable multicast loopback so we don't receive our own announcements */
     int loop = 0;

@@ -16,6 +16,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/stream_buffer.h"
 #include "aes67_config.h"
 
 #ifdef __cplusplus
@@ -202,13 +205,11 @@ esp_err_t aes67_rtp_engine_process_tx(aes67_rtp_engine_handle_t handle,
 /**
  * Get the stream buffer used for RTP RX -> playback decoupling.
  */
-#include "freertos/stream_buffer.h"
 StreamBufferHandle_t aes67_rtp_engine_get_stream_buf(aes67_rtp_engine_handle_t handle);
 
 /**
  * Set the task to notify when new sink data arrives.
  */
-#include "freertos/task.h"
 void aes67_rtp_engine_set_notify_task(aes67_rtp_engine_handle_t handle,
                                       TaskHandle_t task);
 

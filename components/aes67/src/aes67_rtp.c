@@ -912,6 +912,7 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
         /* Set QoS and TTL on the TX socket */
         aes67_net_set_dscp(s->tx_sock, config->dscp);
         aes67_net_set_multicast_ttl(s->tx_sock, config->ttl);
+        aes67_net_set_multicast_if(s->tx_sock);
     }
 
     /* Sink streams: join multicast group */

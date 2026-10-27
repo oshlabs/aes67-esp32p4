@@ -70,10 +70,17 @@ add_dependencies(${COMPONENT_LIB} aes67_web_gz)
 set_property(SOURCE "${AES67_WEB_GZ}" PROPERTY GENERATED TRUE)
 target_add_binary_data(${COMPONENT_LIB} "${AES67_WEB_GZ}" BINARY)
 
+# Every non-static function must have a prototype in a header, so the
+# public surface is what the headers say. The vendored sources are exempt.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wmissing-prototypes)
+set_source_files_properties(
+    third_party/esp_eth_time/esp_eth_time.c
+    PROPERTIES COMPILE_OPTIONS "-Wno-missing-prototypes"
+)
 # ptpd.c is a third-party port with intentionally-unused helpers behind
 # Kconfig; silence that one warning for the bundled file only.
 set_source_files_properties(
     third_party/ptpd/ptpd.c
-    PROPERTIES COMPILE_OPTIONS "-Wno-unused-function"
+    PROPERTIES COMPILE_OPTIONS "-Wno-unused-function;-Wno-missing-prototypes"
 )
 

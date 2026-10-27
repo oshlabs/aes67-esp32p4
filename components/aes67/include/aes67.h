@@ -18,6 +18,11 @@
 #include "freertos/stream_buffer.h"
 #include "aes67_config.h"
 #include "aes67_session.h"
+#include "aes67_audio.h"
+#include "aes67_sap.h"
+#include "aes67_ptp.h"
+#include "aes67_rtp.h"
+#include "aes67_clock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,28 +93,24 @@ esp_err_t aes67_node_get_session(aes67_node_handle_t handle,
 /**
  * Get the audio driver handle from a running node.
  */
-#include "aes67_audio.h"
 esp_err_t aes67_node_get_audio(aes67_node_handle_t handle,
                                aes67_audio_handle_t *audio);
 
 /**
  * Get the SAP handle from a running node.
  */
-#include "aes67_sap.h"
 esp_err_t aes67_node_get_sap(aes67_node_handle_t handle,
                               aes67_sap_handle_t *sap);
 
 /**
  * Get the PTP handle from a running node.
  */
-#include "aes67_ptp.h"
 esp_err_t aes67_node_get_ptp(aes67_node_handle_t handle,
                               aes67_ptp_handle_t *ptp);
 
 /**
  * Get the RTP engine handle from a running node.
  */
-#include "aes67_rtp.h"
 esp_err_t aes67_node_get_rtp(aes67_node_handle_t handle,
                               aes67_rtp_engine_handle_t *rtp);
 
@@ -143,7 +144,6 @@ typedef struct {
 esp_err_t aes67_node_get_tic_stats(aes67_node_handle_t handle, aes67_node_tic_stats_t *stats);
 
 /* Audio clock recovery: how the APLL is tracking PTP */
-#include "aes67_clock.h"
 esp_err_t aes67_node_get_clock_status(aes67_node_handle_t handle, aes67_clock_status_t *status);
 
 

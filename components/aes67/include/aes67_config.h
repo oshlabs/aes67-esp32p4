@@ -18,7 +18,11 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "esp_eth.h"
+#include "sdkconfig.h"
+
+/* The Ethernet driver handle, as esp_eth_driver.h defines it; declared here
+ * so this header does not pull the driver's headers into every user */
+typedef void *esp_eth_handle_t;
 
 #ifdef __cplusplus
 extern "C" {

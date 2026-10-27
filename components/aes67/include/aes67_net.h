@@ -50,6 +50,9 @@ esp_err_t aes67_net_leave_multicast(int sock, const char *mcast_addr,
  */
 esp_err_t aes67_net_set_multicast_ttl(int sock, uint8_t ttl);
 
+/** Send this socket's multicast through the node's interface (not the default route). */
+esp_err_t aes67_net_set_multicast_if(int sock);
+
 /**
  * Set DSCP/TOS on a socket.
  */

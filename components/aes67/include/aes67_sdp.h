@@ -102,11 +102,6 @@ const char *aes67_codec_to_str(aes67_codec_t codec);
 int aes67_codec_from_str(const char *name);
 
 /**
- * Get word length (bytes per sample) for a codec.
- */
-uint8_t aes67_codec_word_length(aes67_codec_t codec);
-
-/**
  * True if name is 1..63 bytes of printable characters (no control
  * characters, no DEL). The rule for session and stream names taken from
  * the network or from an API client.
