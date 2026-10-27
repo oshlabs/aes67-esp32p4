@@ -26,9 +26,6 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
-#include "lwip/udp.h"
-#include "lwip/pbuf.h"
-#include "lwip/igmp.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -116,9 +113,6 @@ struct aes67_rtp_engine {
     esp_timer_handle_t rx_watch;
     aes67_rtp_rx_state_cb_t rx_state_cb;
     void *rx_state_user;
-    /* Direct I2S playback from RX task */
-    bool i2s_playback_enabled;
-    void *audio_handle;
     /* Task to notify when new sink data arrives */
     TaskHandle_t playback_notify_task;
     /* Stream buffer for decoupling RTP RX from I2S DMA */
@@ -133,10 +127,6 @@ struct aes67_rtp_engine {
     int32_t *rx_out;                /* RX_SCRATCH_FRAMES x 2 slots, internal */
     int32_t *tx_scratch;            /* capture routing for non-stereo sources */
     aes67_rtp_rx_stats_t rx_stats;
-    /* Raw lwIP UDP PCB -- processes packets directly in lwIP context,
-     * bypassing socket layer and its ~412us per-packet overhead. */
-    struct udp_pcb *raw_pcb;
-    int32_t *raw_sample_buf;  /* Pre-allocated conversion buffer */
 };
 
 /* --- Ring buffer helpers --- */
@@ -378,99 +368,6 @@ static struct aes67_rtp_stream *find_sink_stream(struct aes67_rtp_engine *engine
 
 /* --- Raw lwIP UDP callback (runs in lwIP task context) --- */
 
-/* Called directly by lwIP when a UDP packet arrives on port 5004.
- * No socket layer, no message queue, no context switch.
- * Processes RTP packets with ~10us overhead instead of ~412us. */
-static void raw_udp_recv_cb(void *arg, struct udp_pcb *pcb,
-                             struct pbuf *p, const ip_addr_t *addr, u16_t port)
-{
-    struct aes67_rtp_engine *engine = (struct aes67_rtp_engine *)arg;
-
-    static uint32_t raw_cb_count = 0;
-    static uint32_t raw_cb_processed = 0;
-    raw_cb_count++;
-
-    if (!p || p->tot_len < AES67_RTP_HEADER_SIZE) {
-        if (p) pbuf_free(p);
-        return;
-    }
-
-    /* Copy pbuf chain to contiguous buffer */
-    uint8_t pkt_buf[2048];
-    if (p->tot_len > sizeof(pkt_buf)) {
-        pbuf_free(p);
-        return;
-    }
-    pbuf_copy_partial(p, pkt_buf, p->tot_len, 0);
-    uint16_t recv_len = p->tot_len;
-    pbuf_free(p);
-
-    /* Parse RTP header */
-    aes67_rtp_header_t hdr;
-    if (!rtp_parse_header(pkt_buf, recv_len, &hdr)) {
-        return;
-    }
-
-    /* Skip own TX packets */
-    for (int i = 0; i < AES67_MAX_STREAMS; i++) {
-        struct aes67_rtp_stream *s = engine->streams[i];
-        if (s && s->direction == AES67_STREAM_SOURCE && s->ssrc == hdr.ssrc) {
-            return;
-        }
-    }
-
-    /* Find matching sink stream */
-    struct aes67_rtp_stream *stream = find_sink_stream(engine, hdr.ssrc, NULL);
-    if (!stream) return;
-
-    /* Validate payload type */
-    if (hdr.pt != stream->config.payload_type) return;
-
-    /* Track sequence */
-    uint16_t expected_seq = stream->status.last_seq + 1;
-    if (stream->status.packets_received > 0 && hdr.seq != expected_seq) {
-        int16_t diff = (int16_t)(hdr.seq - expected_seq);
-        if (diff > 0) stream->status.packets_lost += diff;
-        stream->status.seq_errors++;
-    }
-    stream->status.last_seq = hdr.seq;
-    stream->status.packets_received++;
-
-    /* Convert from network format to int32 */
-    const uint8_t *payload = pkt_buf + AES67_RTP_HEADER_SIZE;
-    uint32_t payload_len = recv_len - AES67_RTP_HEADER_SIZE;
-    uint8_t channels = stream->config.channels;
-    uint8_t wl = stream->config.word_length;
-    uint32_t frame_size_bytes = channels * wl;
-    if (frame_size_bytes == 0 || payload_len < frame_size_bytes) return;
-    uint32_t frames = payload_len / frame_size_bytes;
-    if (frames > AES67_MAX_TIC_FRAMES) frames = AES67_MAX_TIC_FRAMES;
-
-    int32_t *sample_buf = engine->raw_sample_buf;
-    stream->convert_from_net(payload, sample_buf, frames, channels);
-
-    /* Write converted int32 samples to stream buffer for playback */
-    if (engine->audio_stream_buf) {
-        xStreamBufferSend(engine->audio_stream_buf, sample_buf,
-                           frames * channels * sizeof(int32_t), 0);
-    }
-
-    raw_cb_processed++;
-
-    /* Log first packet and periodic stats */
-    if (stream->status.packets_received == 1) {
-        const char *codec_str = (wl == 2) ? "L16" : (wl == 3) ? "L24" : "L32";
-        ESP_LOGI(TAG, "RAW RX: %s/%luHz/%uch, %u frames",
-                 codec_str, (unsigned long)stream->config.sample_rate,
-                 channels, frames);
-    }
-    if ((raw_cb_count % 5000) == 0) {
-        ESP_LOGI(TAG, "RAW: cb=%lu proc=%lu lost=%lu",
-                 (unsigned long)raw_cb_count,
-                 (unsigned long)raw_cb_processed,
-                 (unsigned long)stream->status.packets_lost);
-    }
-}
 
 /* --- RX task --- */
 
@@ -501,12 +398,6 @@ static void rx_task_func(void *arg)
 
     ESP_LOGI(TAG, "RX task started on port %u", engine->net_config.rtp_port);
 
-    /* Timing stats and packet arrival watchdog */
-    static int64_t t_recv_total = 0, t_proc_total = 0;
-    static uint32_t t_count = 0;
-    static int64_t last_pkt_time_us = 0;
-    static int64_t last_stall_warn_us = 0;
-
     while (engine->running) {
         struct sockaddr_in src_addr;
         socklen_t addr_len = sizeof(src_addr);
@@ -517,15 +408,11 @@ static void rx_task_func(void *arg)
         static int drain_pass = 0;
         int flags = drain_pass ? MSG_DONTWAIT : 0;
 
-        int64_t t0 = esp_timer_get_time();
         int recv_len = recvfrom(engine->rx_sock, rx_buf, AES67_RX_BUF_SIZE, flags,
                                 (struct sockaddr *)&src_addr, &addr_len);
-        int64_t t1 = esp_timer_get_time();
         if (recv_len < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 drain_pass = 0;
-                /* Stall watchdog disabled: Ethernet hook handles RTP
-                 * reception at L2, so the socket RX path sees nothing. */
                 continue;
             }
             if (!engine->running) {
@@ -536,7 +423,6 @@ static void rx_task_func(void *arg)
             continue;
         }
         drain_pass = 1;
-        last_pkt_time_us = esp_timer_get_time();
 
         /* Everything below touches the stream table and a stream found in
          * it; a 'continue' inside the do-while(0) leaves the block and
@@ -641,23 +527,6 @@ static void rx_task_func(void *arg)
 
         stream->status.packets_received++;
 
-        int64_t t2 = esp_timer_get_time();
-        t_recv_total += (t1 - t0);
-        t_proc_total += (t2 - t1);
-        t_count++;
-
-        if ((stream->status.packets_received % 10000) == 0) {
-            ESP_LOGI(TAG, "RX: %luk pkts, %lu lost, j=%ldus | "
-                     "recv=%lldus proc=%lldus cycle=%lldus (avg over %lu)",
-                     (unsigned long)(stream->status.packets_received / 1000),
-                     (unsigned long)stream->status.packets_lost,
-                     (long)stream->jitter_us,
-                     t_count > 0 ? (long long)(t_recv_total / t_count) : 0,
-                     t_count > 0 ? (long long)(t_proc_total / t_count) : 0,
-                     t_count > 0 ? (long long)((t_recv_total + t_proc_total) / t_count) : 0,
-                     (unsigned long)t_count);
-        }
-
         /* Log first packet only */
         if (stream->status.packets_received == 1) {
             const char *codec_str = (wl == 2) ? "L16" : (wl == 3) ? "L24" : (wl == 4) ? "L32" : "???";
@@ -716,31 +585,6 @@ esp_err_t aes67_rtp_engine_init(const aes67_net_config_t *net_config,
     uint32_t sbuf_size = practical_max_pkt * 8;
     engine->audio_stream_buf = xStreamBufferCreate(sbuf_size, practical_max_pkt);
 
-    /* Raw lwIP UDP PCB disabled when Ethernet hook is active.
-     * The hook intercepts RTP at L2 before lwIP, so the raw PCB would
-     * either see nothing (packets freed by hook) or duplicate-process
-     * packets that slip through, wasting CPU and memory.
-     * The raw PCB is only useful as fallback when the hook is not installed. */
-#if 0  /* Disabled: Ethernet hook handles RTP reception */
-    engine->raw_pcb = udp_new();
-    if (engine->raw_pcb) {
-        err_t err = udp_bind(engine->raw_pcb, IP_ADDR_ANY, net_config->rtp_port);
-        if (err == ERR_OK) {
-            udp_recv(engine->raw_pcb, raw_udp_recv_cb, engine);
-            ESP_LOGI(TAG, "Raw UDP PCB bound to port %u", net_config->rtp_port);
-        } else {
-            udp_remove(engine->raw_pcb);
-            engine->raw_pcb = NULL;
-        }
-    }
-    engine->raw_sample_buf = heap_caps_malloc(
-        CONFIG_AES67_MAX_CHANNELS_PER_STREAM * 192 * sizeof(int32_t),
-        MALLOC_CAP_INTERNAL);
-#else
-    engine->raw_pcb = NULL;
-    engine->raw_sample_buf = NULL;
-    ESP_LOGI(TAG, "Raw UDP PCB disabled (Ethernet hook handles RTP)");
-#endif
     if (!engine->audio_stream_buf) {
         ESP_LOGE(TAG, "Failed to create audio stream buffer");
     }
@@ -766,25 +610,20 @@ esp_err_t aes67_rtp_engine_init(const aes67_net_config_t *net_config,
         return ESP_ERR_NO_MEM;
     }
 
-    /* Create the RX socket only if raw PCB is not active.
-     * Raw PCB already binds to the port, so socket bind would fail. */
-    if (!engine->raw_pcb) {
-        engine->rx_sock = aes67_net_create_udp_socket(net_config->rtp_port, true);
-        if (engine->rx_sock < 0) {
-            ESP_LOGE(TAG, "Failed to create RX socket on port %u",
-                     net_config->rtp_port);
-            if (engine->audio_stream_buf) vStreamBufferDelete(engine->audio_stream_buf);
-            heap_caps_free(engine->rx_scratch);
-            heap_caps_free(engine->rx_out);
-            heap_caps_free(engine->tx_scratch);
-            vSemaphoreDelete(engine->lock);
-            vSemaphoreDelete(engine->rx_done);
-            free(engine);
-            return ESP_FAIL;
-        }
-    } else {
-        /* Still need a socket for TX and multicast joins */
-        engine->rx_sock = aes67_net_create_udp_socket(0, true);  /* Ephemeral port */
+    /* The RX socket: the receive path when the Ethernet hook is off, and
+     * the socket multicast joins are made on in any case */
+    engine->rx_sock = aes67_net_create_udp_socket(net_config->rtp_port, true);
+    if (engine->rx_sock < 0) {
+        ESP_LOGE(TAG, "Failed to create RX socket on port %u",
+                 net_config->rtp_port);
+        if (engine->audio_stream_buf) vStreamBufferDelete(engine->audio_stream_buf);
+        heap_caps_free(engine->rx_scratch);
+        heap_caps_free(engine->rx_out);
+        heap_caps_free(engine->tx_scratch);
+        vSemaphoreDelete(engine->lock);
+        vSemaphoreDelete(engine->rx_done);
+        free(engine);
+        return ESP_FAIL;
     }
 
     /* Set socket receive timeout so the RX task can check the running flag */
@@ -860,16 +699,6 @@ void aes67_rtp_engine_set_notify_task(aes67_rtp_engine_handle_t handle,
     }
 }
 
-void aes67_rtp_engine_set_playback(aes67_rtp_engine_handle_t handle,
-                                   void *audio_handle)
-{
-    if (handle) {
-        handle->audio_handle = audio_handle;
-        handle->i2s_playback_enabled = (audio_handle != NULL);
-        ESP_LOGI(TAG, "I2S playback from RX task %s",
-                 handle->i2s_playback_enabled ? "enabled" : "disabled");
-    }
-}
 
 esp_err_t aes67_rtp_engine_start(aes67_rtp_engine_handle_t handle)
 {
@@ -1089,14 +918,7 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
     if (s->direction == AES67_STREAM_SINK && aes67_net_is_multicast(config->dest_ip)) {
         char mcast_str[16];
         aes67_net_u32_to_ip(config->dest_ip, mcast_str, sizeof(mcast_str));
-        /* Join via socket (for legacy RX task) */
         err = aes67_net_join_multicast(engine->rx_sock, mcast_str, NULL);
-        /* Also join via lwIP IGMP for the raw PCB path */
-        if (engine->raw_pcb) {
-            ip4_addr_t mcast_ip;
-            mcast_ip.addr = config->dest_ip;
-            igmp_joingroup(IP4_ADDR_ANY4, &mcast_ip);
-        }
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Failed to join multicast group %s", mcast_str);
         }
@@ -1218,31 +1040,6 @@ esp_err_t aes67_rtp_stream_get_status(aes67_rtp_stream_handle_t stream,
     return ESP_OK;
 }
 
-esp_err_t aes67_rtp_source_write(aes67_rtp_stream_handle_t stream,
-                                 const void *samples, uint32_t frame_count)
-{
-    if (!stream || !samples) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (stream->direction != AES67_STREAM_SOURCE) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!stream->active) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    /* Caller provides int32_t samples (left-justified). Store 4 bytes per
-     * sample in the ring buffer regardless of the wire word_length. */
-    uint32_t byte_count = frame_count * stream->config.channels * sizeof(int32_t);
-    uint32_t written = ringbuf_write(&stream->ring, (const uint8_t *)samples,
-                                     byte_count);
-    if (written < byte_count) {
-        stream->status.status_flags |= AES67_RTP_STATUS_OVERFLOW;
-        return ESP_ERR_NO_MEM;
-    }
-
-    return ESP_OK;
-}
 
 esp_err_t aes67_rtp_engine_set_playout_buf(aes67_rtp_engine_handle_t handle,
                                            StreamBufferHandle_t sbuf)
@@ -1473,53 +1270,7 @@ esp_err_t aes67_rtp_engine_feed_capture(aes67_rtp_engine_handle_t handle,
     return ESP_OK;
 }
 
-esp_err_t aes67_rtp_sink_read(aes67_rtp_stream_handle_t stream,
-                              void *samples, uint32_t frame_count)
-{
-    if (!stream || !samples) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (stream->direction != AES67_STREAM_SINK) {
-        return ESP_ERR_INVALID_ARG;
-    }
 
-    /* Ring buffer stores int32_t samples (4 bytes each) */
-    uint32_t byte_count = frame_count * stream->config.channels * sizeof(int32_t);
-
-    /* If stream is muted, return silence */
-    if (stream->status.status_flags & AES67_RTP_STATUS_MUTED) {
-        memset(samples, 0, byte_count);
-        return ESP_OK;
-    }
-
-    uint32_t avail = ringbuf_available(&stream->ring);
-    if (avail < byte_count) {
-        memset(samples, 0, byte_count);
-        stream->status.status_flags |= AES67_RTP_STATUS_UNDERFLOW;
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint32_t read_bytes = ringbuf_read(&stream->ring, (uint8_t *)samples,
-                                       byte_count);
-    if (read_bytes < byte_count) {
-        /* Partial read, zero remainder */
-        memset((uint8_t *)samples + read_bytes, 0, byte_count - read_bytes);
-        stream->status.status_flags |= AES67_RTP_STATUS_UNDERFLOW;
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    /* Clear underflow flag on successful read */
-    stream->status.status_flags &= ~AES67_RTP_STATUS_UNDERFLOW;
-    return ESP_OK;
-}
-
-uint32_t aes67_rtp_sink_available(aes67_rtp_stream_handle_t stream)
-{
-    if (!stream || stream->direction != AES67_STREAM_SINK) return 0;
-    uint32_t bytes = ringbuf_available(&stream->ring);
-    uint32_t frame_bytes = stream->config.channels * sizeof(int32_t);
-    return frame_bytes > 0 ? bytes / frame_bytes : 0;
-}
 
 esp_err_t aes67_rtp_engine_process_tx(aes67_rtp_engine_handle_t handle,
                                       uint32_t rtp_timestamp)

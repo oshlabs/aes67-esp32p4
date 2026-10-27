@@ -38,65 +38,12 @@ struct aes67_audio_ctx {
     i2s_chan_handle_t tx_chan;
     i2s_chan_handle_t rx_chan;
     aes67_audio_config_t config;
-
-    /* Ring buffers (PSRAM when use_psram is set) */
-    int32_t *capture_buf;
-    int32_t *playback_buf;
-    uint32_t buf_size_frames;
-    volatile uint32_t capture_wr;
-    volatile uint32_t capture_rd;
-    volatile uint32_t playback_wr;
-    volatile uint32_t playback_rd;
-
-    /* DMA staging buffers (always internal SRAM) */
-    uint8_t *dma_rx_buf;
-    uint8_t *dma_tx_buf;
-    uint32_t dma_buf_size_bytes;
-
-    /* Pre-allocated int16 conversion buffer for direct_write.
-     * Avoids heap_caps_malloc/free on every write call. */
-    int16_t *i2s_conv_buf;
-    uint32_t i2s_conv_buf_samples;
-
-    /* DMA completion semaphore - signaled by on_sent ISR callback */
-    SemaphoreHandle_t dma_sem;
-
-    /* Staging ring buffer: RTP RX writes int16 data here,
-     * DMA ISR reads from here to fill DMA descriptors directly. */
-    int16_t *staging_buf;
-    uint32_t staging_size;      /* Total size in int16 samples */
-    volatile uint32_t staging_wr;
-    volatile uint32_t staging_rd;
-    volatile uint32_t staging_underruns;  /* ISR couldn't fill full descriptor */
-    volatile uint32_t staging_isr_count;  /* Total ISR calls */
-    volatile bool staging_ready;          /* ISR reads only when true */
-
-    /* Frame callback */
-
-    /* I/O task */
-    TaskHandle_t io_task;
     bool running;
-    bool use_psram;
-
-    /* Samples per frame period: sample_rate * packet_time_us / 1000000 */
-    uint32_t frame_size;
+    uint32_t frame_size;        /* frames per packet period */
 };
 
 /* --- Helpers --------------------------------------------------------------- */
 
-/* Convert word_length (bytes per sample) to I2S bit width enum.
- * Currently unused since we force 16-bit I2S for ES8311 compat,
- * but kept for future use with other codecs. */
-__attribute__((unused))
-static i2s_data_bit_width_t word_length_to_bits(uint8_t word_length)
-{
-    switch (word_length) {
-    case 2:  return I2S_DATA_BIT_WIDTH_16BIT;
-    case 3:  return I2S_DATA_BIT_WIDTH_24BIT;
-    case 4:  return I2S_DATA_BIT_WIDTH_32BIT;
-    default: return I2S_DATA_BIT_WIDTH_24BIT;
-    }
-}
 
 /* In ESP32-P4 Philips I2S mode with 32-bit slot width, the DMA data
  * is already left-justified (MSB-first) in the 32-bit word. This means
@@ -105,72 +52,11 @@ static i2s_data_bit_width_t word_length_to_bits(uint8_t word_length)
  * data bit width (16/24/32), because the I2S hardware handles the
  * slot-to-wire packing. */
 
-/* Available frames in a ring buffer (single-producer / single-consumer safe) */
-static inline uint32_t ring_available(uint32_t wr, uint32_t rd, uint32_t capacity)
-{
-    return (wr - rd) % capacity;
-}
 
-/* Free frames in a ring buffer */
-static inline uint32_t ring_free(uint32_t wr, uint32_t rd, uint32_t capacity)
-{
-    /* Reserve one frame to distinguish full from empty */
-    return capacity - 1 - ring_available(wr, rd, capacity);
-}
 
 /* --- DMA <-> Ring Buffer Conversion --------------------------------------- */
 
-/* Copy DMA buffer (32-bit slots) directly to capture ring buffer.
- * Both DMA and ring buffer use left-justified int32 format. */
-__attribute__((unused))
-static void dma_to_capture_ring(struct aes67_audio_ctx *ctx,
-                                const uint8_t *dma_buf,
-                                uint32_t frame_count)
-{
-    const uint8_t ch = ctx->config.channels;
-    const uint32_t cap = ctx->buf_size_frames;
-    const int32_t *src = (const int32_t *)dma_buf;
-    uint32_t wr = ctx->capture_wr;
 
-    for (uint32_t f = 0; f < frame_count; f++) {
-        uint32_t ring_idx = (wr % cap) * ch;
-        for (uint8_t c = 0; c < ch; c++) {
-            ctx->capture_buf[ring_idx + c] = src[f * ch + c];
-        }
-        wr++;
-    }
-    ctx->capture_wr = wr;
-}
-
-/* Read from playback ring buffer and copy to DMA TX buffer.
- * Both use left-justified int32 format - direct copy, no shifting. */
-__attribute__((unused))
-static void playback_ring_to_dma(struct aes67_audio_ctx *ctx,
-                                 uint8_t *dma_buf,
-                                 uint32_t frame_count)
-{
-    const uint8_t ch = ctx->config.channels;
-    const uint32_t cap = ctx->buf_size_frames;
-    int32_t *dst = (int32_t *)dma_buf;
-    uint32_t rd = ctx->playback_rd;
-
-    uint32_t avail = ring_available(ctx->playback_wr, rd, cap);
-
-    for (uint32_t f = 0; f < frame_count; f++) {
-        if (f < avail) {
-            uint32_t ring_idx = (rd % cap) * ch;
-            for (uint8_t c = 0; c < ch; c++) {
-                dst[f * ch + c] = ctx->playback_buf[ring_idx + c];
-            }
-            rd++;
-        } else {
-            for (uint8_t c = 0; c < ch; c++) {
-                dst[f * ch + c] = 0;
-            }
-        }
-    }
-    ctx->playback_rd = rd;
-}
 
 /* --- DMA callbacks -------------------------------------------------------- */
 
@@ -424,62 +310,6 @@ void aes67_audio_capture_notify_once(aes67_audio_handle_t handle, TaskHandle_t t
 }
 
 
-/* Legacy staging ISR (unused, kept for reference) */
-__attribute__((unused))
-static IRAM_ATTR bool on_i2s_tx_sent(i2s_chan_handle_t handle,
-                                      i2s_event_data_t *event,
-                                      void *user_ctx)
-{
-    struct aes67_audio_ctx *ctx = (struct aes67_audio_ctx *)user_ctx;
-    int16_t *dma_buf = (int16_t *)event->dma_buf;
-    uint32_t dma_samples = event->size / sizeof(int16_t);
-
-    /* Don't read from staging until it has enough data */
-    if (!ctx->staging_ready) {
-        memset(dma_buf, 0, event->size);
-        esp_cache_msync(event->dma_buf, event->size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-        ctx->staging_isr_count++;
-        return false;
-    }
-
-    /* Copy from staging ring to DMA buffer */
-    uint32_t rd = ctx->staging_rd;
-    uint32_t wr = ctx->staging_wr;
-    uint32_t cap = ctx->staging_size;
-    uint32_t avail = (wr >= rd) ? (wr - rd) : (cap - rd + wr);
-
-    uint32_t to_copy = (avail < dma_samples) ? avail : dma_samples;
-    uint32_t first = cap - (rd % cap);
-    if (first > to_copy) first = to_copy;
-
-    /* Fast copy from staging ring (internal SRAM, no cache issues) */
-    memcpy(dma_buf, &ctx->staging_buf[rd % cap], first * sizeof(int16_t));
-    if (to_copy > first) {
-        memcpy(dma_buf + first, ctx->staging_buf,
-               (to_copy - first) * sizeof(int16_t));
-    }
-
-    /* Zero-fill if not enough data (silence on underrun) */
-    if (to_copy < dma_samples) {
-        memset(dma_buf + to_copy, 0, (dma_samples - to_copy) * sizeof(int16_t));
-    }
-
-    ctx->staging_rd = (rd + to_copy) % cap;
-    ctx->staging_isr_count++;
-    if (to_copy < dma_samples) {
-        ctx->staging_underruns++;
-    }
-
-    /* Flush CPU cache to memory so DMA controller sees the new data.
-     * ESP32-P4 routes internal SRAM through L1 cache -- without this
-     * sync, DMA reads stale data and produces crackling. */
-    esp_cache_msync(event->dma_buf, event->size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-
-    /* Notify playback task to refill staging buffer */
-    BaseType_t woken = pdFALSE;
-    xSemaphoreGiveFromISR(ctx->dma_sem, &woken);
-    return woken == pdTRUE;
-}
 
 /* --- Public API ----------------------------------------------------------- */
 
@@ -500,11 +330,12 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     }
 
     memcpy(&ctx->config, audio_config, sizeof(aes67_audio_config_t));
-    ctx->use_psram = use_psram;
+    (void)use_psram;            /* the playout and capture buffers are internal */
+    (void)ring_buf_ms;
 
     /* Compute frame size: samples per packet period */
-    ctx->frame_size = (uint32_t)audio_config->sample_rate *
-                      audio_config->packet_time_us / 1000000;
+    ctx->frame_size = aes67_frames_per_packet(audio_config->sample_rate,
+                                              audio_config->packet_time_us);
     if (ctx->frame_size == 0) {
         ESP_LOGE(TAG, "Invalid sample_rate/packet_time combination");
         free(ctx);
@@ -517,37 +348,7 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
              audio_config->word_length,
              (unsigned long)ctx->frame_size);
 
-    /* --- Allocate ring buffers --- */
-    uint32_t ring_frames = (audio_config->sample_rate * ring_buf_ms) / 1000;
-    if (ring_frames < ctx->frame_size * 4) {
-        ring_frames = ctx->frame_size * 4;
-    }
-    /* Add 1 for the sentinel frame (full/empty disambiguation) */
-    ring_frames += 1;
-    ctx->buf_size_frames = ring_frames;
-
-    size_t ring_bytes = ring_frames * audio_config->channels * sizeof(int32_t);
-    uint32_t alloc_caps = use_psram ? MALLOC_CAP_SPIRAM : MALLOC_CAP_DEFAULT;
-
-    esp_err_t ret = ESP_ERR_NO_MEM;
-    ctx->capture_buf = heap_caps_calloc(1, ring_bytes, alloc_caps);
-    ctx->playback_buf = heap_caps_calloc(1, ring_bytes, alloc_caps);
-    if (!ctx->capture_buf || !ctx->playback_buf) {
-        ESP_LOGE(TAG, "Failed to allocate ring buffers (%u bytes each)", (unsigned)ring_bytes);
-        goto err_free_bufs;
-    }
-
-    /* --- Allocate DMA staging buffers (internal SRAM) --- */
-    ctx->dma_buf_size_bytes = ctx->frame_size * audio_config->channels * sizeof(int32_t);
-    ctx->dma_rx_buf = heap_caps_calloc(1, ctx->dma_buf_size_bytes,
-                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    ctx->dma_tx_buf = heap_caps_calloc(1, ctx->dma_buf_size_bytes,
-                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!ctx->dma_rx_buf || !ctx->dma_tx_buf) {
-        ESP_LOGE(TAG, "Failed to allocate DMA buffers (%lu bytes each)",
-                 (unsigned long)ctx->dma_buf_size_bytes);
-        goto err_free_bufs;
-    }
+    esp_err_t ret;
 
     /* --- Configure I2S channels --- */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG((i2s_port_t)CONFIG_AES67_I2S_PORT, I2S_ROLE_MASTER);
@@ -620,64 +421,18 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     }
 
     ctx->running = false;
-    ctx->capture_wr = 0;
-    ctx->capture_rd = 0;
-    ctx->playback_wr = 0;
-    ctx->playback_rd = 0;
-
-    /* Staging ring: RTP RX writes int16, DMA ISR reads.
-     * 10 packets of headroom to absorb network jitter and
-     * phase differences between packet arrival and DMA consumption. */
-    ctx->staging_size = ctx->frame_size * 10 * audio_config->channels;
-    ctx->staging_buf = heap_caps_calloc(ctx->staging_size, sizeof(int16_t),
-                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!ctx->staging_buf) {
-        ESP_LOGE(TAG, "Failed to allocate staging ring");
-        ret = ESP_ERR_NO_MEM;
-        goto err_del_channel;
-    }
-    ctx->staging_wr = 0;
-    ctx->staging_rd = 0;
-    ctx->staging_ready = false;
-
-    /* Binary semaphore: DMA ISR signals when descriptor consumed */
-    ctx->dma_sem = xSemaphoreCreateBinary();
-    if (!ctx->dma_sem) {
-        ESP_LOGE(TAG, "Failed to create DMA semaphore");
-        ret = ESP_ERR_NO_MEM;
-        goto err_del_channel;
-    }
-
-    /* Pre-allocate int16 conversion buffer for direct_write.
-     * Size for max batch: 25 packets worth of frames. */
-    ctx->i2s_conv_buf_samples = ctx->frame_size * 25 * audio_config->channels;
-    ctx->i2s_conv_buf = heap_caps_malloc(
-        ctx->i2s_conv_buf_samples * sizeof(int16_t),
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!ctx->i2s_conv_buf) {
-        ESP_LOGE(TAG, "Failed to allocate I2S conversion buffer (%lu bytes)",
-                 (unsigned long)(ctx->i2s_conv_buf_samples * sizeof(int16_t)));
-        ret = ESP_ERR_NO_MEM;
-        goto err_del_channel;
-    }
 
     *handle = ctx;
-    ESP_LOGI(TAG, "Audio driver initialized (ring=%lu frames, dma=%lu bytes)",
-             (unsigned long)ring_frames, (unsigned long)ctx->dma_buf_size_bytes);
+    ESP_LOGI(TAG, "Audio driver initialized (DMA %d x %d frames, playout/capture buffers %u bytes)",
+             DMA_DESC_NUM, DMA_FRAME_NUM, (unsigned)AES67_AUDIO_STREAM_BUF_BYTES);
     return ESP_OK;
 
 err_del_channel:
     /* Only reached once both channels exist; the i2s_new_channel failure
      * path lands at err_free_bufs instead. */
-    if (ctx->dma_sem) vSemaphoreDelete(ctx->dma_sem);
-    heap_caps_free(ctx->staging_buf);
     i2s_del_channel(ctx->tx_chan);
     i2s_del_channel(ctx->rx_chan);
 err_free_bufs:
-    heap_caps_free(ctx->capture_buf);
-    heap_caps_free(ctx->playback_buf);
-    heap_caps_free(ctx->dma_rx_buf);
-    heap_caps_free(ctx->dma_tx_buf);
     free(ctx);
     return ret;
 }
@@ -786,16 +541,6 @@ esp_err_t aes67_audio_destroy(aes67_audio_handle_t handle)
     i2s_del_channel(handle->tx_chan);
     i2s_del_channel(handle->rx_chan);
 
-    /* Free all buffers */
-    heap_caps_free(handle->capture_buf);
-    heap_caps_free(handle->playback_buf);
-    heap_caps_free(handle->dma_rx_buf);
-    heap_caps_free(handle->dma_tx_buf);
-    heap_caps_free(handle->i2s_conv_buf);
-    heap_caps_free(handle->staging_buf);
-    if (handle->dma_sem) {
-        vSemaphoreDelete(handle->dma_sem);
-    }
     /* The two ISR stream buffers are file statics (single instance) */
     if (s_isr_stream_buf) {
         vStreamBufferDelete(s_isr_stream_buf);
@@ -812,125 +557,8 @@ esp_err_t aes67_audio_destroy(aes67_audio_handle_t handle)
 }
 
 
-esp_err_t aes67_audio_write_playback(aes67_audio_handle_t handle,
-                                     const void *samples, uint32_t frame_count)
-{
-    if (!handle || !samples) {
-        return ESP_ERR_INVALID_ARG;
-    }
 
-    const int32_t *src = (const int32_t *)samples;
-    const uint8_t ch = handle->config.channels;
-    const uint32_t cap = handle->buf_size_frames;
 
-    uint32_t free_frames = ring_free(handle->playback_wr, handle->playback_rd, cap);
-    if (frame_count > free_frames) {
-        /* Not enough room. Just overwrite - the I2S read task will
-         * pick up the latest data. Don't touch playback_rd here as
-         * that would race with the I2S I/O task reading it. */
-        frame_count = free_frames;
-        if (frame_count == 0) return ESP_OK;
-    }
-
-    uint32_t wr = handle->playback_wr;
-    for (uint32_t f = 0; f < frame_count; f++) {
-        uint32_t ring_idx = (wr % cap) * ch;
-        for (uint8_t c = 0; c < ch; c++) {
-            handle->playback_buf[ring_idx + c] = src[f * ch + c];
-        }
-        wr++;
-    }
-    handle->playback_wr = wr;
-
-    return ESP_OK;
-}
-
-esp_err_t aes67_audio_read_capture(aes67_audio_handle_t handle,
-                                   void *samples, uint32_t frame_count)
-{
-    if (!handle || !samples) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    int32_t *dst = (int32_t *)samples;
-    const uint8_t ch = handle->config.channels;
-    const uint32_t cap = handle->buf_size_frames;
-
-    uint32_t avail = ring_available(handle->capture_wr, handle->capture_rd, cap);
-    if (frame_count > avail) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint32_t rd = handle->capture_rd;
-    for (uint32_t f = 0; f < frame_count; f++) {
-        uint32_t ring_idx = (rd % cap) * ch;
-        for (uint8_t c = 0; c < ch; c++) {
-            dst[f * ch + c] = handle->capture_buf[ring_idx + c];
-        }
-        rd++;
-    }
-    handle->capture_rd = rd;
-
-    return ESP_OK;
-}
-
-esp_err_t aes67_audio_direct_write(aes67_audio_handle_t handle,
-                                   const int32_t *samples, uint32_t frame_count)
-{
-    if (!handle || !samples || frame_count == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint32_t total_samples = frame_count * handle->config.channels;
-
-    /* Clamp to pre-allocated buffer capacity */
-    if (total_samples > handle->i2s_conv_buf_samples) {
-        total_samples = handle->i2s_conv_buf_samples;
-        frame_count = total_samples / handle->config.channels;
-    }
-
-    /* With 24-bit I2S (32-bit slots), write int32 directly to DMA.
-     * The L24 conversion already produces left-justified int32.
-     * No truncation needed -- full 24-bit quality preserved. */
-    size_t bytes_written = 0;
-    size_t bytes_to_write = total_samples * sizeof(int32_t);
-
-    int64_t t0 = esp_timer_get_time();
-    esp_err_t ret = i2s_channel_write(handle->tx_chan, samples, bytes_to_write,
-                                       &bytes_written, portMAX_DELAY);
-    int64_t t1 = esp_timer_get_time();
-
-    /* Measure i2s_channel_write timing to find the throughput bottleneck */
-    static int64_t total_write_us = 0;
-    static int64_t total_between_us = 0;
-    static int64_t last_end_us = 0;
-    if (last_end_us > 0) {
-        total_between_us += (t0 - last_end_us);
-    }
-    last_end_us = t1;
-    total_write_us += (t1 - t0);
-
-    /* Log first few writes with sample values for debugging format issues */
-    static uint32_t write_log_count = 0;
-    if (write_log_count < 3) {
-        write_log_count++;
-        ESP_LOGI(TAG, "I2S write #%lu: %u/%u bytes, frames=%lu, ret=%s, "
-                 "write=%lldus, between=%lldus | "
-                 "int32[0..3]: %+ld %+ld %+ld %+ld -> "
-                 "int16[0..3]: %+d %+d %+d %+d",
-                 (unsigned long)write_log_count,
-                 (unsigned)bytes_written, (unsigned)bytes_to_write,
-                 (unsigned long)frame_count, esp_err_to_name(ret),
-                 (long long)(t1 - t0),
-                 (long long)(last_end_us > 0 ? (t0 - (last_end_us - (t1 - t0))) : 0),
-                 (long)samples[0], (long)samples[1],
-                 (long)samples[2], (long)samples[3],
-                 (long)samples[0], (long)samples[1],
-                 (long)samples[2], (long)samples[3]);
-    }
-
-    return ret;
-}
 
 esp_err_t aes67_audio_get_config(aes67_audio_handle_t handle,
                                  aes67_audio_config_t *config)
@@ -943,83 +571,9 @@ esp_err_t aes67_audio_get_config(aes67_audio_handle_t handle,
     return ESP_OK;
 }
 
-esp_err_t aes67_audio_get_buffer_levels(aes67_audio_handle_t handle,
-                                        uint32_t *capture_frames,
-                                        uint32_t *playback_frames)
-{
-    if (!handle) {
-        return ESP_ERR_INVALID_ARG;
-    }
 
-    if (capture_frames) {
-        *capture_frames = ring_available(handle->capture_wr, handle->capture_rd,
-                                         handle->buf_size_frames);
-    }
-    if (playback_frames) {
-        *playback_frames = ring_available(handle->playback_wr, handle->playback_rd,
-                                          handle->buf_size_frames);
-    }
 
-    return ESP_OK;
-}
 
-/* Write int16 stereo samples to the staging ring buffer.
- * Called by the playback task. The DMA ISR reads from this ring. */
-esp_err_t aes67_audio_staging_write(aes67_audio_handle_t handle,
-                                     const int16_t *samples, uint32_t sample_count)
-{
-    if (!handle || !samples) return ESP_ERR_INVALID_ARG;
-
-    uint32_t cap = handle->staging_size;
-    uint32_t wr = handle->staging_wr;
-    uint32_t rd = handle->staging_rd;
-    uint32_t avail = (wr >= rd) ? (wr - rd) : (cap - rd + wr);
-    uint32_t free_samples = cap - 1 - avail;  /* -1 for sentinel */
-
-    if (sample_count > free_samples) {
-        sample_count = free_samples;
-    }
-    if (sample_count == 0) return ESP_OK;
-
-    uint32_t pos = wr % cap;
-    uint32_t first = cap - pos;
-    if (first > sample_count) first = sample_count;
-
-    memcpy(&handle->staging_buf[pos], samples, first * sizeof(int16_t));
-    if (sample_count > first) {
-        memcpy(handle->staging_buf, samples + first,
-               (sample_count - first) * sizeof(int16_t));
-    }
-
-    handle->staging_wr = (wr + sample_count) % cap;
-
-    /* Enable ISR reads once staging is at least half full (20ms).
-     * More headroom = more tolerance for network jitter. */
-    if (!handle->staging_ready) {
-        uint32_t new_wr = handle->staging_wr;
-        uint32_t cur_rd = handle->staging_rd;
-        uint32_t filled = (new_wr >= cur_rd) ? (new_wr - cur_rd) : (cap - cur_rd + new_wr);
-        if (filled >= cap / 2) {
-            handle->staging_ready = true;
-        }
-    }
-
-    return ESP_OK;
-}
-
-void aes67_audio_get_staging_stats(aes67_audio_handle_t handle,
-                                    uint32_t *isr_count, uint32_t *underruns)
-{
-    if (handle) {
-        if (isr_count) *isr_count = handle->staging_isr_count;
-        if (underruns) *underruns = handle->staging_underruns;
-    }
-}
-
-SemaphoreHandle_t aes67_audio_get_dma_sem(aes67_audio_handle_t handle)
-{
-    return handle ? handle->dma_sem : NULL;
-}
 
 i2s_chan_handle_t aes67_audio_get_tx_chan(aes67_audio_handle_t handle)
 {

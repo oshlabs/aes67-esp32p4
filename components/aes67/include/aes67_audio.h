@@ -17,6 +17,10 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "aes67_config.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/stream_buffer.h"
+#include "driver/i2s_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,8 +35,8 @@ typedef struct aes67_audio_ctx *aes67_audio_handle_t;
  *
  * @param audio_config  Audio parameters (sample rate, channels, format)
  * @param pins          I2S pin configuration
- * @param use_psram     If true, allocate ring buffers in PSRAM
- * @param ring_buf_ms   Ring buffer size in milliseconds
+ * @param use_psram     Unused (the playout and capture buffers are internal)
+ * @param ring_buf_ms   Unused
  * @param handle        Output handle
  */
 esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
@@ -56,34 +60,7 @@ esp_err_t aes67_audio_stop(aes67_audio_handle_t handle);
  */
 esp_err_t aes67_audio_destroy(aes67_audio_handle_t handle);
 
-/**
- * Register the audio frame callback. The callback is invoked from a
- * high-priority task each time a DMA transfer completes (one frame period).
- */
 
-/**
- * Write samples to the playback ring buffer (sink path).
- * Called from the RTP jitter buffer read path.
- *
- * @param handle        Audio driver handle
- * @param samples       Interleaved audio samples
- * @param frame_count   Number of frames to write
- * @return ESP_OK, or ESP_ERR_NO_MEM if buffer full
- */
-esp_err_t aes67_audio_write_playback(aes67_audio_handle_t handle,
-                                     const void *samples, uint32_t frame_count);
-
-/**
- * Read samples from the capture ring buffer (source path).
- * Called by the RTP engine to get audio data for transmission.
- *
- * @param handle        Audio driver handle
- * @param samples       Output buffer for interleaved samples
- * @param frame_count   Number of frames to read
- * @return ESP_OK, or ESP_ERR_NOT_FOUND if insufficient data
- */
-esp_err_t aes67_audio_read_capture(aes67_audio_handle_t handle,
-                                   void *samples, uint32_t frame_count);
 
 /**
  * Get current audio parameters.
@@ -91,42 +68,15 @@ esp_err_t aes67_audio_read_capture(aes67_audio_handle_t handle,
 esp_err_t aes67_audio_get_config(aes67_audio_handle_t handle,
                                  aes67_audio_config_t *config);
 
-/**
- * Get buffer fill levels (for monitoring).
- *
- * @param handle            Audio driver handle
- * @param capture_frames    Frames available in capture ring buffer
- * @param playback_frames   Frames available in playback ring buffer
- */
-esp_err_t aes67_audio_get_buffer_levels(aes67_audio_handle_t handle,
-                                        uint32_t *capture_frames,
-                                        uint32_t *playback_frames);
+
 
 /**
- * Write int32 samples directly to I2S via i2s_channel_write.
- * Blocks until DMA has room (used for DMA-paced playback).
+ * Get the I2S TX channel handle (the playback task writes to it in
+ * callback and stream-buffer output modes).
  */
-esp_err_t aes67_audio_direct_write(aes67_audio_handle_t handle,
-                                   const int32_t *samples, uint32_t frame_count);
-
-/**
- * Get the I2S TX channel handle (for DMA-paced playback).
- */
-#include "driver/i2s_types.h"
 i2s_chan_handle_t aes67_audio_get_tx_chan(aes67_audio_handle_t handle);
 
-/**
- * Write int16 stereo samples to the staging ring buffer.
- * Called by the playback task; the DMA ISR reads from this ring.
- */
-esp_err_t aes67_audio_staging_write(aes67_audio_handle_t handle,
-                                     const int16_t *samples, uint32_t sample_count);
 
-/**
- * Get DMA staging statistics.
- */
-void aes67_audio_get_staging_stats(aes67_audio_handle_t handle,
-                                    uint32_t *isr_count, uint32_t *underruns);
 
 /**
  * The playout stream buffer the DMA ISR plays from: two-slot interleaved

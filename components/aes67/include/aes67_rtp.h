@@ -159,29 +159,7 @@ esp_err_t aes67_rtp_stream_remove(aes67_rtp_engine_handle_t engine,
 esp_err_t aes67_rtp_stream_get_status(aes67_rtp_stream_handle_t stream,
                                       aes67_rtp_stream_status_t *status);
 
-/**
- * Write audio samples to a source stream's buffer (called by audio driver).
- * Samples are interleaved, in native byte order, at the stream's word length.
- *
- * @param stream        Source stream handle
- * @param samples       Pointer to interleaved sample data
- * @param frame_count   Number of audio frames (one sample per channel = one frame)
- * @return ESP_OK on success
- */
-esp_err_t aes67_rtp_source_write(aes67_rtp_stream_handle_t stream,
-                                 const void *samples, uint32_t frame_count);
 
-/**
- * Read audio samples from a sink stream's jitter buffer (called by audio driver).
- * Returns silence if the jitter buffer is empty or the stream is muted.
- *
- * @param stream        Sink stream handle
- * @param samples       Output buffer for interleaved sample data
- * @param frame_count   Number of frames to read
- * @return ESP_OK on success, ESP_ERR_NOT_FOUND if no data available
- */
-esp_err_t aes67_rtp_sink_read(aes67_rtp_stream_handle_t stream,
-                              void *samples, uint32_t frame_count);
 
 /**
  * Offer a received Ethernet frame to the engine. If it is RTP for one of the
@@ -234,16 +212,7 @@ StreamBufferHandle_t aes67_rtp_engine_get_stream_buf(aes67_rtp_engine_handle_t h
 void aes67_rtp_engine_set_notify_task(aes67_rtp_engine_handle_t handle,
                                       TaskHandle_t task);
 
-/**
- * Enable/disable direct I2S playback from the RTP RX path.
- */
-void aes67_rtp_engine_set_playback(aes67_rtp_engine_handle_t handle,
-                                   void *audio_handle);
 
-/**
- * Get available frames in a sink stream's jitter buffer.
- */
-uint32_t aes67_rtp_sink_available(aes67_rtp_stream_handle_t stream);
 
 #ifdef __cplusplus
 }
