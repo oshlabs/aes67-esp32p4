@@ -93,8 +93,9 @@ int aes67_sdp_generate(const aes67_sdp_t *sdp, char *buf, size_t buf_len)
                  sdp->ptp_grandmaster_id[6], sdp->ptp_grandmaster_id[7]);
     }
 
-    /* Compute samples per packet for the framecount attribute */
-    uint32_t framecount = (sdp->sample_rate * sdp->ptime_us) / 1000000;
+    /* Frames per packet for the framecount attribute (rounded: 0.333 ms is 16) */
+    uint32_t framecount = sdp->framecount ? sdp->framecount
+                        : aes67_frames_per_packet(sdp->sample_rate, sdp->ptime_us);
     if (framecount == 0) framecount = 48;
 
     int written = snprintf(buf, buf_len,
@@ -326,6 +327,8 @@ static void parse_attribute(const char *val, aes67_sdp_t *sdp)
         parse_rtpmap(val + 7, sdp);
     } else if (strncmp(val, "ptime:", 6) == 0) {
         sdp->ptime_us = parse_ptime_us(val + 6);
+    } else if (strncmp(val, "framecount:", 11) == 0) {
+        sdp->framecount = (uint16_t)atoi(val + 11);
     } else if (strncmp(val, "ts-refclk:", 10) == 0) {
         parse_ts_refclk(val + 10, sdp);
     } else if (strncmp(val, "mediaclk:", 9) == 0) {

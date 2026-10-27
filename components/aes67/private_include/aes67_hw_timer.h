@@ -29,13 +29,26 @@ typedef void (*aes67_hw_timer_cb_t)(void *user_data);
 /**
  * Initialize the hardware PTP frame timer.
  *
- * @param frame_period_ns  Frame period in nanoseconds (e.g. 1000000 for 1ms)
- * @param cb               Callback to fire at each frame boundary
- * @param user_data        User data passed to callback
- * @return ESP_OK on success
+ * The timer runs on the media clock's frame grid: boundaries are at
+ * multiples of `frames_per_period` frames of PTP time (frame k is at
+ * k / sample_rate seconds since the epoch). For 16 frames at 48 kHz the
+ * targets alternate 333333 and 333334 ns, and never drift from the
+ * second boundaries as a rounded nanosecond period would.
+ *
+ * @param frames_per_period  Frames per tick (the packet's frame count)
+ * @param sample_rate        Media clock rate in Hz
+ * @param cb                 Callback to fire at each frame boundary
+ * @param user_data          User data passed to callback
  */
-esp_err_t aes67_hw_timer_init(uint32_t frame_period_ns,
+esp_err_t aes67_hw_timer_init(uint32_t frames_per_period, uint32_t sample_rate,
                                aes67_hw_timer_cb_t cb, void *user_data);
+
+/** PTP time in media clock frames (frame k is at k / rate seconds) */
+static inline uint64_t aes67_frames_from_ns(uint64_t ns, uint32_t sample_rate)
+{
+    return (ns / 1000000000ULL) * sample_rate +
+           ((ns % 1000000000ULL) * sample_rate) / 1000000000ULL;
+}
 
 /**
  * Start the hardware frame timer. Programs the first target time
@@ -66,7 +79,9 @@ typedef struct {
 } aes67_hw_timer_stats_t;
 
 void aes67_hw_timer_get_stats(aes67_hw_timer_stats_t *stats);
+/** Nominal period in nanoseconds (rounded; for wait bounds, not for the grid) */
 uint32_t aes67_hw_timer_period_ns(void);
+uint32_t aes67_hw_timer_frames_per_period(void);
 
 #ifdef __cplusplus
 }

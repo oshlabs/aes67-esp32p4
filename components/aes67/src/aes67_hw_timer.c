@@ -34,7 +34,9 @@ static const char *TAG = "aes67_hw_timer";
 #define HW_TIMER_GUARD_NS   100000
 
 static struct {
-    uint32_t frame_period_ns;
+    uint32_t frames_per_period;
+    uint32_t sample_rate;
+    uint32_t frame_period_ns;       /* nominal, rounded */
     aes67_hw_timer_cb_t cb;
     void *user_data;
     struct timespec next_time;
@@ -44,14 +46,20 @@ static struct {
     volatile uint32_t rearms;       /* re-armed from task context after a stall */
 } s_timer;
 
-/* Add nanoseconds to a timespec, handling overflow */
-static inline void timespec_add_ns(struct timespec *ts, uint32_t ns)
+/* The first frame boundary strictly after `now_ns` (plus the guard), as a
+ * timespec: the grid is in frames of PTP time, converted back to
+ * nanoseconds exactly (truncated), so it stays aligned with the seconds. */
+static inline void next_boundary_after(uint64_t now_ns, struct timespec *out)
 {
-    ts->tv_nsec += ns;
-    while (ts->tv_nsec >= 1000000000L) {
-        ts->tv_nsec -= 1000000000L;
-        ts->tv_sec++;
-    }
+    uint64_t frames = aes67_frames_from_ns(now_ns, s_timer.sample_rate);
+    uint64_t next = (frames / s_timer.frames_per_period + 1) * s_timer.frames_per_period;
+    out->tv_sec = (time_t)(next / s_timer.sample_rate);
+    out->tv_nsec = (long)(((next % s_timer.sample_rate) * 1000000000ULL) / s_timer.sample_rate);
+}
+
+static inline uint64_t timespec_ns(const struct timespec *ts)
+{
+    return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
 }
 
 /* ISR callback from EMAC when PTP clock reaches target time.
@@ -68,8 +76,8 @@ IRAM_ATTR static bool hw_timer_isr(esp_eth_mediator_t *eth, void *user_args)
         s_timer.cb(s_timer.user_data);
     }
 
-    /* Schedule the next target time */
-    timespec_add_ns(&s_timer.next_time, s_timer.frame_period_ns);
+    /* Schedule the next target: the frame boundary after this one */
+    next_boundary_after(timespec_ns(&s_timer.next_time), &s_timer.next_time);
 
     /* The next target must lie safely in the future when it is written.
      * If we are late (ISR latency, a PTP step) or merely too close, skip
@@ -79,15 +87,10 @@ IRAM_ATTR static bool hw_timer_isr(esp_eth_mediator_t *eth, void *user_args)
     struct timespec now;
     esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &now);
 
-    int64_t diff_ns = ((int64_t)s_timer.next_time.tv_sec - now.tv_sec) * 1000000000LL
-                    + (s_timer.next_time.tv_nsec - now.tv_nsec);
+    int64_t diff_ns = (int64_t)(timespec_ns(&s_timer.next_time) - timespec_ns(&now));
 
     if (diff_ns < HW_TIMER_GUARD_NS) {
-        uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec + HW_TIMER_GUARD_NS;
-        uint64_t period = s_timer.frame_period_ns;
-        uint64_t next_ns = ((now_ns / period) + 1) * period;
-        s_timer.next_time.tv_sec = (time_t)(next_ns / 1000000000ULL);
-        s_timer.next_time.tv_nsec = (long)(next_ns % 1000000000ULL);
+        next_boundary_after(timespec_ns(&now) + HW_TIMER_GUARD_NS, &s_timer.next_time);
         s_timer.reanchors++;
     }
 
@@ -96,15 +99,18 @@ IRAM_ATTR static bool hw_timer_isr(esp_eth_mediator_t *eth, void *user_args)
     return false;
 }
 
-esp_err_t aes67_hw_timer_init(uint32_t frame_period_ns,
+esp_err_t aes67_hw_timer_init(uint32_t frames_per_period, uint32_t sample_rate,
                                aes67_hw_timer_cb_t cb, void *user_data)
 {
-    if (!cb || frame_period_ns == 0) {
+    if (!cb || frames_per_period == 0 || sample_rate == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
     memset(&s_timer, 0, sizeof(s_timer));
-    s_timer.frame_period_ns = frame_period_ns;
+    s_timer.frames_per_period = frames_per_period;
+    s_timer.sample_rate = sample_rate;
+    s_timer.frame_period_ns = (uint32_t)(((uint64_t)frames_per_period * 1000000000ULL +
+                                          sample_rate / 2) / sample_rate);
     s_timer.cb = cb;
     s_timer.user_data = user_data;
     s_timer.running = false;
@@ -116,7 +122,9 @@ esp_err_t aes67_hw_timer_init(uint32_t frame_period_ns,
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "initialized (period=%lu ns)", (unsigned long)frame_period_ns);
+    ESP_LOGI(TAG, "initialized (%lu frames at %lu Hz, %lu ns)",
+             (unsigned long)frames_per_period, (unsigned long)sample_rate,
+             (unsigned long)s_timer.frame_period_ns);
     return ESP_OK;
 }
 
@@ -130,12 +138,7 @@ esp_err_t aes67_hw_timer_start(void)
     }
 
     /* Align to the next frame boundary at least a guard interval ahead */
-    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec + HW_TIMER_GUARD_NS;
-    uint64_t period = s_timer.frame_period_ns;
-    uint64_t next_ns = ((now_ns / period) + 1) * period;
-
-    s_timer.next_time.tv_sec = (time_t)(next_ns / 1000000000ULL);
-    s_timer.next_time.tv_nsec = (long)(next_ns % 1000000000ULL);
+    next_boundary_after(timespec_ns(&now) + HW_TIMER_GUARD_NS, &s_timer.next_time);
     s_timer.running = true;
 
     /* Program the first target time */
@@ -160,12 +163,7 @@ esp_err_t aes67_hw_timer_rearm(void)
     if (esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &now) != 0) {
         return ESP_FAIL;
     }
-    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec + HW_TIMER_GUARD_NS;
-    uint64_t period = s_timer.frame_period_ns;
-    uint64_t next_ns = ((now_ns / period) + 1) * period;
-
-    s_timer.next_time.tv_sec = (time_t)(next_ns / 1000000000ULL);
-    s_timer.next_time.tv_nsec = (long)(next_ns % 1000000000ULL);
+    next_boundary_after(timespec_ns(&now) + HW_TIMER_GUARD_NS, &s_timer.next_time);
     esp_eth_clock_set_target_time(CLOCK_PTP_SYSTEM, &s_timer.next_time);
     s_timer.rearms++;
 
@@ -201,4 +199,9 @@ void aes67_hw_timer_get_stats(aes67_hw_timer_stats_t *stats)
 uint32_t aes67_hw_timer_period_ns(void)
 {
     return s_timer.frame_period_ns;
+}
+
+uint32_t aes67_hw_timer_frames_per_period(void)
+{
+    return s_timer.frames_per_period;
 }

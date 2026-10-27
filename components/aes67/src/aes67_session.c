@@ -361,6 +361,12 @@ esp_err_t aes67_session_add_sink(aes67_session_handle_t handle,
     rtp_cfg.word_length = sdp.word_length;
     rtp_cfg.codec = sdp.codec;
     rtp_cfg.packet_time_us = sdp.ptime_us;
+    if (sdp.framecount && sdp.sample_rate) {
+        /* The SDP names the frame count: derive the packet time from it so
+         * the stream parameters reproduce exactly that count */
+        rtp_cfg.packet_time_us = (uint16_t)(((uint64_t)sdp.framecount * 1000000ULL +
+                                             sdp.sample_rate / 2) / sdp.sample_rate);
+    }
     rtp_cfg.playout_delay_us = (uint32_t)mgr->config.jitter_buffer_ms * 1000;
     rtp_cfg.dscp = mgr->config.net.dscp;
     rtp_cfg.ttl = mgr->config.net.ttl;

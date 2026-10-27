@@ -84,6 +84,14 @@ typedef struct {
     uint32_t max_packet_payload;    /* Max RTP payload: MAX_TIC_FRAMES * frame_bytes_wire */
 } aes67_stream_params_t;
 
+/* Frames per packet for a packet time. Rounded, not truncated: AES67's
+ * "0.333 ms" is the decimal spelling of 16 frames at 48 kHz (and 0.125 of
+ * 6, 0.25 of 12), so 48000 * 333 / 1e6 must give 16, not 15. */
+static inline uint32_t aes67_frames_per_packet(uint32_t sample_rate, uint32_t packet_time_us)
+{
+    return (uint32_t)(((uint64_t)sample_rate * packet_time_us + 500000ULL) / 1000000ULL);
+}
+
 /* Compute derived parameters from base config */
 static inline void aes67_stream_params_compute(aes67_stream_params_t *p,
                                                 uint32_t sample_rate,
@@ -96,7 +104,7 @@ static inline void aes67_stream_params_compute(aes67_stream_params_t *p,
     p->word_length = word_length;
     p->packet_time_us = packet_time_us;
 
-    p->samples_per_packet = (sample_rate * (uint32_t)packet_time_us) / 1000000;
+    p->samples_per_packet = aes67_frames_per_packet(sample_rate, packet_time_us);
     if (p->samples_per_packet == 0) p->samples_per_packet = 48;
     if (p->samples_per_packet > AES67_MAX_TIC_FRAMES) {
         p->samples_per_packet = AES67_MAX_TIC_FRAMES;

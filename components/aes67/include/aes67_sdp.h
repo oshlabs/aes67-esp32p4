@@ -48,8 +48,11 @@ typedef struct {
     uint8_t channels;
     uint8_t word_length;
 
-    /* Packet time (a=ptime) */
+    /* Packet time (a=ptime) and, when the SDP says so, the exact frame
+     * count (a=framecount; RAVENNA). The frame count wins: a ptime of
+     * 0.333 is a rounded 16 frames. */
     uint16_t ptime_us;                  /* Packet time in microseconds */
+    uint16_t framecount;                /* Frames per packet, 0 if not given */
 
     /* PTP reference clock (a=ts-refclk) */
     bool has_ptp_refclk;

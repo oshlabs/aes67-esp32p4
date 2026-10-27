@@ -107,8 +107,8 @@ static void audio_frame_task(void *arg)
     uint32_t frame_count = 0;
 
     /* Pre-allocate playback buffer for sink -> I2S path */
-    uint32_t spp = (node->config.audio.sample_rate *
-                     node->config.audio.packet_time_us) / 1000000;
+    const uint32_t rate = node->config.audio.sample_rate;
+    uint32_t spp = aes67_frames_per_packet(rate, node->config.audio.packet_time_us);
     int32_t *playback_buf = heap_caps_malloc(
         spp * node->config.audio.channels * sizeof(int32_t),
         MALLOC_CAP_INTERNAL);
@@ -130,7 +130,10 @@ static void audio_frame_task(void *arg)
     /* Wait at most two periods (at least 2 ms) for a wake-up before
      * treating the timer as stalled. */
     const TickType_t wait_ticks = pdMS_TO_TICKS((period_ns * 2) / 1000000 < 2 ? 2 : (period_ns * 2) / 1000000);
-    uint64_t last_boundary_ns = 0;      /* PTP time of the last processed frame boundary */
+    /* Tick boundaries live on the media clock's frame grid (frame k of
+     * PTP time is at k / rate seconds), so a tick's RTP timestamp is its
+     * boundary's frame count and the grid never drifts from the seconds */
+    uint64_t last_boundary_fr = 0;      /* frame count of the last processed boundary */
     uint32_t missed_waits = 0;
     uint32_t catchups = 0, stalls = 0, deferrals = 0;
     int64_t last_stall_log_us = 0;
@@ -153,7 +156,7 @@ static void audio_frame_task(void *arg)
                         xStreamBufferReceive(cap_buf, cap_samples, need, 0);
                     }
                 }
-                last_boundary_ns = 0;
+                last_boundary_fr = 0;
             }
             continue;
         }
@@ -165,10 +168,10 @@ static void audio_frame_task(void *arg)
          * each with its own packet, so the stream stays on PTP time. */
         uint64_t now_ns;
         aes67_ptp_get_time_ns(node->ptp, &now_ns);
-        uint64_t boundary_ns = (now_ns / period_ns) * period_ns;
+        uint64_t boundary_fr = (aes67_frames_from_ns(now_ns, rate) / spp) * spp;
         uint32_t due = 1;
-        if (last_boundary_ns != 0 && boundary_ns > last_boundary_ns) {
-            due = (uint32_t)((boundary_ns - last_boundary_ns) / period_ns);
+        if (last_boundary_fr != 0 && boundary_fr > last_boundary_fr) {
+            due = (uint32_t)((boundary_fr - last_boundary_fr) / spp);
             if (due > TIC_MAX_CATCHUP) {
                 /* Too far behind to be a busy core: treat as a stall,
                  * drop the backlog and resume from here. */
@@ -180,10 +183,10 @@ static void audio_frame_task(void *arg)
                     }
                 }
             }
-        } else if (last_boundary_ns != 0 && boundary_ns == last_boundary_ns) {
+        } else if (last_boundary_fr != 0 && boundary_fr == last_boundary_fr) {
             due = 0;                    /* woken twice within one period */
         }
-        last_boundary_ns = boundary_ns;
+        last_boundary_fr = boundary_fr;
 
         for (uint32_t k = 0; k < due; k++) {
             /* A tick is processed only once its packet of captured audio
@@ -196,7 +199,7 @@ static void audio_frame_task(void *arg)
              * one chunk period away, rather than wait a whole frame period. */
             if (cap_buf && cap_samples) {
                 if (xStreamBufferBytesAvailable(cap_buf) < need) {
-                    last_boundary_ns = boundary_ns - (uint64_t)(due - k) * period_ns;
+                    last_boundary_fr = boundary_fr - (uint64_t)(due - k) * spp;
                     aes67_audio_capture_notify_once(node->audio, s_tic_task);
                     deferrals++;
                     break;
@@ -210,9 +213,8 @@ static void audio_frame_task(void *arg)
                 catchups++;
             }
 
-            /* RTP timestamp for this tick's boundary */
-            uint64_t tick_ns = boundary_ns - (uint64_t)(due - 1 - k) * period_ns;
-            uint32_t rtp_ts = aes67_ptp_time_to_rtp_ts(tick_ns, node->config.audio.sample_rate);
+            /* RTP timestamp for this tick's boundary: its frame count */
+            uint32_t rtp_ts = (uint32_t)(boundary_fr - (uint64_t)(due - 1 - k) * spp);
 
             /* TX: Process all active source streams - read from ring buffers,
              * convert to network format, send RTP packets */
@@ -499,12 +501,10 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
     }
 #endif
 
-    /* 7. Initialize hardware PTP frame timer for RTP TX.
-     * frame_period = samples_per_packet / sample_rate in nanoseconds */
-    uint32_t samples_per_pkt = (node->config.audio.sample_rate *
-                                 node->config.audio.packet_time_us) / 1000000;
-    uint32_t frame_ns = (uint32_t)((uint64_t)samples_per_pkt * 1000000000ULL /
-                                    node->config.audio.sample_rate);
+    /* 7. Initialize the hardware PTP frame timer for RTP TX: one tick
+     * per packet's worth of frames, on the media clock's frame grid */
+    uint32_t samples_per_pkt = aes67_frames_per_packet(node->config.audio.sample_rate,
+                                                       node->config.audio.packet_time_us);
 
     node->tic_done = xSemaphoreCreateBinary();
     node->pb_done = xSemaphoreCreateBinary();
@@ -513,7 +513,8 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
         goto fail_cb;
     }
 
-    ret = aes67_hw_timer_init(frame_ns, hw_frame_isr, NULL);
+    ret = aes67_hw_timer_init(samples_per_pkt, node->config.audio.sample_rate,
+                              hw_frame_isr, NULL);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "hw PTP timer init failed: %s (falling back to I2S timing)",
                  esp_err_to_name(ret));
