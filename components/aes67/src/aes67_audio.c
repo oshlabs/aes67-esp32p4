@@ -356,10 +356,10 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG((i2s_port_t)CONFIG_AES67_I2S_PORT, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = DMA_DESC_NUM;
     chan_cfg.dma_frame_num = DMA_FRAME_NUM;
-    /* When using ISR callback, auto_clear doesn't matter because the ISR
-     * fills every descriptor (with data or silence). Set false for
-     * i2s_channel_write compatibility in non-ISR modes. */
-    chan_cfg.auto_clear = true;
+    /* The TX ISR fills every descriptor (with data or silence), so no
+     * auto clear. Since IDF 5.3 auto_clear aliases auto_clear_after_cb,
+     * which zeroes the buffer right after on_sent has filled it. */
+    chan_cfg.auto_clear = false;
 
     /* The DMA ISR plays from, and the capture ISR records into, two
      * stream buffers the driver owns (single instance, file statics). */
