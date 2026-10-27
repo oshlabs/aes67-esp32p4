@@ -71,8 +71,8 @@ menu "AES67 Example"
         help
             Announce a stereo L24 source carrying the codec ADC input as soon as the
             node is up, so AES67 receivers can subscribe without any other sender on
-            the network. The SAP discovery callback may still add a second,
-            codec-matched source when a remote source is found.
+            the network. It is the example's only source: without it the node
+            sends nothing.
 
     config EXAMPLE_MIC_SOURCE_NAME
         string "Microphone source name (SDP s= line)"

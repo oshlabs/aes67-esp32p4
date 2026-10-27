@@ -74,22 +74,6 @@ static void sap_discovery_cb(bool is_announce,
                                             source->sdp, &sink_id);
     if (err == ESP_OK) {
         s_sink_added = true;
-        aes67_sink_t sink;
-        if (aes67_session_get_sink(s_session, sink_id, &sink) == ESP_OK) {
-            /* Create a matching source with the same codec, channels and
-             * packet time (the engine paces each source by its own ptime) */
-            uint8_t src_id = 0;
-            esp_err_t src_err = aes67_session_add_source(
-                s_session, "ESP32-P4 AES67",
-                sink.rtp_config.channels, sink.rtp_config.codec,
-                sink.rtp_config.packet_time_us, &src_id);
-            if (src_err == ESP_OK) {
-                ESP_LOGI("main", "Source matched to sink: %uch %s %uus",
-                         sink.rtp_config.channels,
-                         aes67_codec_to_str(sink.rtp_config.codec),
-                         sink.rtp_config.packet_time_us);
-            }
-        }
         ESP_LOGI("main", "Sink added (id=%u) -- receiving \"%s\"",
                  sink_id, source->name);
     } else {
@@ -546,8 +530,7 @@ void app_main(void)
 #if CONFIG_EXAMPLE_CREATE_MIC_SOURCE
     /* Create a mic source at boot so receivers (e.g. an AES67 speaker)
      * can subscribe without any remote source being present. The ES8311
-     * ADC is mono; the stream is stereo L24 at the default 1 ms ptime.
-     * The SAP callback may add a second, codec-matched source later. */
+     * ADC is mono; the stream is stereo L24 at the default 1 ms ptime. */
     {
         uint8_t src_id = 0;
         esp_err_t src_err = aes67_session_add_source(session, CONFIG_EXAMPLE_MIC_SOURCE_NAME,
