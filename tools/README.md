@@ -9,6 +9,8 @@ commit messages.
 |---|---|
 | `aes67_probe.py` | Join a multicast stream on a wired host: packet rate, sequence gaps, payload type, per-channel level, and RTP timestamp offset against the AES67 media clock (TAI * rate). |
 | `aes67_send.py` | Reference sender (L24/48k/2, 1 ms, tone) with correct timestamps. Proves a receiver's path, and bisects DSCP/TTL questions. |
+| `aes67_play.py` | Play an audio file (anything ffmpeg reads, or raw s24be PCM) as an L24/48k/2 stream with SAP, timestamps on the media clock. A node that auto-subscribes plays it: the listening test for a sink. |
+| `aes67_relay.py` | Relay a multicast stream to another group, packets unchanged, and announce the copy over SAP. A node cannot receive its own multicast; relayed, it can play its own source (with auto-subscribe: the microphone on its own speaker). |
 | `aes67_receiver_ctl.py` | Subscribe, inspect and capture on a Coveloz/BACH-based receiver (Neumann KH series) through its JSON API. |
 
 ## Typical session
