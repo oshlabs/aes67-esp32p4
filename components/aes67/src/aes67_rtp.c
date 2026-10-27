@@ -109,6 +109,7 @@ struct aes67_rtp_engine {
     bool running;
     bool use_psram;
     aes67_net_config_t net_config;
+    uint32_t tic_frames;            /* frames the TIC feeds per tick (sizes source rings) */
     /* Direct I2S playback from RX task */
     bool i2s_playback_enabled;
     void *audio_handle;
@@ -259,7 +260,7 @@ static bool rtp_parse_header(const uint8_t *buf, size_t len,
 /* --- Stream allocation helpers --- */
 
 static esp_err_t stream_alloc_buffers(struct aes67_rtp_stream *stream,
-                                      bool use_psram)
+                                      bool use_psram, uint32_t tic_frames)
 {
     uint32_t buf_size;
 
@@ -270,11 +271,16 @@ static esp_err_t stream_alloc_buffers(struct aes67_rtp_stream *stream,
         uint32_t packet_bytes = stream->samples_per_packet * frame_size;
         buf_size = packet_bytes * AES67_JITTER_BUF_MULT;
     } else {
-        /* Source TX buffer stores int32_t samples (4 bytes each).
-         * The convert-to-net step packs them into word_length on send. */
+        /* Source TX buffer stores int32_t samples (4 bytes each); the
+         * convert-to-net step packs them into word_length on send. The TIC
+         * writes a tick's worth of frames at a time, so the ring must hold
+         * several ticks even when the packet is much shorter than a tick. */
         uint32_t frame_size = stream->config.channels * sizeof(int32_t);
-        uint32_t packet_bytes = stream->samples_per_packet * frame_size;
-        buf_size = packet_bytes * AES67_JITTER_BUF_MULT;
+        uint32_t unit = stream->samples_per_packet;
+        if (tic_frames > unit) {
+            unit = tic_frames;
+        }
+        buf_size = unit * frame_size * AES67_JITTER_BUF_MULT;
     }
 
     /* Add 1 byte for ring buffer full/empty distinction */
@@ -793,6 +799,13 @@ StreamBufferHandle_t aes67_rtp_engine_get_stream_buf(aes67_rtp_engine_handle_t h
     return handle ? handle->audio_stream_buf : NULL;
 }
 
+void aes67_rtp_engine_set_tic_frames(aes67_rtp_engine_handle_t handle, uint32_t frames)
+{
+    if (handle) {
+        handle->tic_frames = frames;
+    }
+}
+
 void aes67_rtp_engine_set_notify_task(aes67_rtp_engine_handle_t handle,
                                       TaskHandle_t task)
 {
@@ -974,7 +987,7 @@ esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine_handle,
              (unsigned long)s->params.packet_native_size);
 
     /* Allocate ring and scratch buffers */
-    esp_err_t err = stream_alloc_buffers(s, engine->use_psram);
+    esp_err_t err = stream_alloc_buffers(s, engine->use_psram, engine->tic_frames);
     if (err != ESP_OK) {
         free(s);
         engine_unlock(engine);
@@ -1473,7 +1486,10 @@ esp_err_t aes67_rtp_engine_process_tx(aes67_rtp_engine_handle_t handle,
              * grid, when the running timestamp deviates by more than a
              * few packets. Small deviations keep sequential continuity. */
             int32_t diff = (int32_t)(ptp_ts - s->rtp_timestamp);
-            int32_t limit = (int32_t)(spp * 4);
+            /* A source whose packet is shorter than the tick is legitimately
+             * up to a tick's worth of packets behind at the start of a tick */
+            uint32_t unit = spp > engine->tic_frames ? spp : engine->tic_frames;
+            int32_t limit = (int32_t)(unit * 4);
             if (diff > limit || diff < -limit) {
                 /* Log at most once per 10 s: a blocking UART print here
                  * costs several ticks and would re-trigger this path. */
@@ -1489,87 +1505,82 @@ esp_err_t aes67_rtp_engine_process_tx(aes67_rtp_engine_handle_t handle,
             }
         }
 
-        /* Ring buffer stores int32_t samples (4 bytes each, native endian).
-         * Read them into a temp area, then convert to packed network order. */
-        uint32_t samples_total = s->samples_per_packet * s->config.channels;
+        /* Send every packet that has fallen due. The tick is the node's
+         * packet time; a source with a shorter one sends several packets
+         * per tick, a source with a longer one sends every few ticks. A
+         * packet is due once the tick has passed the end of its audio. */
+        uint32_t samples_total = spp * s->config.channels;
         uint32_t needed_bytes = samples_total * sizeof(int32_t);
-
-        /* Check if we have enough data in the ring buffer */
-        uint32_t avail = ringbuf_available(&s->ring);
-        if (avail < needed_bytes) {
-            /* Capture underrun: skip this packet but keep media time
-             * moving, so the stream reads as one lost packet instead of
-             * sliding behind PTP time. */
-            s->status.status_flags |= AES67_RTP_STATUS_UNDERFLOW;
-            s->seq_num++;
-            s->rtp_timestamp += s->samples_per_packet;
-            continue;
-        }
-
-        uint8_t *pkt = s->tx_packet_buf;
-        uint8_t *payload = pkt + AES67_RTP_HEADER_SIZE;
-
-        /* The payload area is sized for packed wire format. We need a
-         * temporary buffer for the int32_t samples read from the ring.
-         * Use the payload area (which is at least as large) plus some
-         * extra stack space if needed. For safety, use a heap buffer
-         * that the stream already has - the payload area is
-         * samples_per_packet * channels * word_length bytes, while we
-         * need samples_per_packet * channels * 4 bytes. When word_length < 4,
-         * the payload area is too small. Use a small stack buffer. */
-        int32_t sample_buf[CONFIG_AES67_MAX_CHANNELS_PER_STREAM * 48];
-        uint32_t frames = s->samples_per_packet;
         uint8_t channels = s->config.channels;
         uint8_t wl = s->config.word_length;
+        uint32_t guard = 0;
 
-        /* Process in chunks if samples_per_packet exceeds our stack buffer */
-        uint32_t chunk_frames = sizeof(sample_buf) / (channels * sizeof(int32_t));
-        uint32_t frames_done = 0;
-        uint8_t *payload_ptr = payload;
-
-        while (frames_done < frames) {
-            uint32_t batch = frames - frames_done;
-            if (batch > chunk_frames) batch = chunk_frames;
-
-            uint32_t batch_bytes = batch * channels * sizeof(int32_t);
-            uint32_t read_bytes = ringbuf_read(&s->ring,
-                                               (uint8_t *)sample_buf,
-                                               batch_bytes);
-            if (read_bytes < batch_bytes) {
+        while ((int32_t)(ptp_ts - s->rtp_timestamp) >= 0 && guard++ < 64) {
+            if (ringbuf_available(&s->ring) < needed_bytes) {
+                /* Capture underrun: skip this packet but keep media time
+                 * moving, so the stream reads as one lost packet instead
+                 * of sliding behind PTP time. */
                 s->status.status_flags |= AES67_RTP_STATUS_UNDERFLOW;
-                break;
+                s->seq_num++;
+                s->rtp_timestamp += spp;
+                continue;
             }
 
-            /* Convert int32_t native samples to packed big-endian wire format */
-            s->convert_to_net(sample_buf, payload_ptr, batch, channels);
+            uint8_t *pkt = s->tx_packet_buf;
+            uint8_t *payload = pkt + AES67_RTP_HEADER_SIZE;
 
-            payload_ptr += batch * channels * wl;
-            frames_done += batch;
-        }
+            /* The ring holds int32 samples; the payload area is sized for
+             * the packed wire format, so read through a stack buffer in
+             * chunks and convert each chunk into place. */
+            int32_t sample_buf[CONFIG_AES67_MAX_CHANNELS_PER_STREAM * 48];
+            uint32_t chunk_frames = sizeof(sample_buf) / (channels * sizeof(int32_t));
+            uint32_t frames_done = 0;
+            uint8_t *payload_ptr = payload;
 
-        if (frames_done < frames) {
-            continue;
-        }
+            while (frames_done < spp) {
+                uint32_t batch = spp - frames_done;
+                if (batch > chunk_frames) batch = chunk_frames;
 
-        rtp_build_header(pkt, s->config.payload_type, s->seq_num,
-                         s->rtp_timestamp, s->ssrc);
-        s->seq_num++;
-        s->rtp_timestamp += s->samples_per_packet;
+                uint32_t batch_bytes = batch * channels * sizeof(int32_t);
+                uint32_t read_bytes = ringbuf_read(&s->ring,
+                                                   (uint8_t *)sample_buf,
+                                                   batch_bytes);
+                if (read_bytes < batch_bytes) {
+                    s->status.status_flags |= AES67_RTP_STATUS_UNDERFLOW;
+                    break;
+                }
 
-        /* Send the packet */
-        uint32_t pkt_size = AES67_RTP_HEADER_SIZE + s->packet_payload_size;
-        ssize_t sent = sendto(s->tx_sock, pkt, pkt_size, 0,
-                              (struct sockaddr *)&s->dest_addr,
-                              sizeof(s->dest_addr));
-        if (sent < 0) {
-            ESP_LOGW(TAG, "sendto failed for stream [%d]: %d (%s)",
-                     i, errno, strerror(errno));
-        } else {
-            s->status.packets_sent++;
-            s->status.last_rtp_timestamp = rtp_timestamp;
-            s->status.last_seq = s->seq_num - 1;
-            /* Clear underflow on successful send */
-            s->status.status_flags &= ~AES67_RTP_STATUS_UNDERFLOW;
+                /* Convert int32_t native samples to packed big-endian wire format */
+                s->convert_to_net(sample_buf, payload_ptr, batch, channels);
+
+                payload_ptr += batch * channels * wl;
+                frames_done += batch;
+            }
+
+            if (frames_done < spp) {
+                break;              /* cannot happen with a single reader; be safe */
+            }
+
+            rtp_build_header(pkt, s->config.payload_type, s->seq_num,
+                             s->rtp_timestamp, s->ssrc);
+            s->seq_num++;
+            s->rtp_timestamp += spp;
+
+            /* Send the packet */
+            uint32_t pkt_size = AES67_RTP_HEADER_SIZE + s->packet_payload_size;
+            ssize_t sent = sendto(s->tx_sock, pkt, pkt_size, 0,
+                                  (struct sockaddr *)&s->dest_addr,
+                                  sizeof(s->dest_addr));
+            if (sent < 0) {
+                ESP_LOGW(TAG, "sendto failed for stream [%d]: %d (%s)",
+                         i, errno, strerror(errno));
+            } else {
+                s->status.packets_sent++;
+                s->status.last_rtp_timestamp = s->rtp_timestamp - spp;
+                s->status.last_seq = s->seq_num - 1;
+                /* Clear underflow on successful send */
+                s->status.status_flags &= ~AES67_RTP_STATUS_UNDERFLOW;
+            }
         }
     }
     engine_unlock(engine);

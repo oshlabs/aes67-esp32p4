@@ -76,12 +76,13 @@ static void sap_discovery_cb(bool is_announce,
         s_sink_added = true;
         aes67_sink_t sink;
         if (aes67_session_get_sink(s_session, sink_id, &sink) == ESP_OK) {
-            /* Create a matching source with same codec/channels/ptime */
-            aes67_session_set_packet_time(s_session, sink.rtp_config.packet_time_us);
+            /* Create a matching source with the same codec, channels and
+             * packet time (the engine paces each source by its own ptime) */
             uint8_t src_id = 0;
             esp_err_t src_err = aes67_session_add_source(
                 s_session, "ESP32-P4 AES67",
-                sink.rtp_config.channels, sink.rtp_config.codec, &src_id);
+                sink.rtp_config.channels, sink.rtp_config.codec,
+                sink.rtp_config.packet_time_us, &src_id);
             if (src_err == ESP_OK) {
                 ESP_LOGI("main", "Source matched to sink: %uch %s %uus",
                          sink.rtp_config.channels,
@@ -550,7 +551,7 @@ void app_main(void)
     {
         uint8_t src_id = 0;
         esp_err_t src_err = aes67_session_add_source(session, CONFIG_EXAMPLE_MIC_SOURCE_NAME,
-                                                     2, AES67_CODEC_L24, &src_id);
+                                                     2, AES67_CODEC_L24, 0, &src_id);
         if (src_err == ESP_OK) {
             ESP_LOGI(TAG, "Mic source \"%s\" created (id=%u): 2ch L24, announced via SAP",
                      CONFIG_EXAMPLE_MIC_SOURCE_NAME, src_id);

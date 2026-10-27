@@ -505,6 +505,7 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
      * per packet's worth of frames, on the media clock's frame grid */
     uint32_t samples_per_pkt = aes67_frames_per_packet(node->config.audio.sample_rate,
                                                        node->config.audio.packet_time_us);
+    aes67_rtp_engine_set_tic_frames(node->rtp, samples_per_pkt);
 
     node->tic_done = xSemaphoreCreateBinary();
     node->pb_done = xSemaphoreCreateBinary();

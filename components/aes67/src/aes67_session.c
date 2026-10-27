@@ -122,6 +122,7 @@ esp_err_t aes67_session_add_source(aes67_session_handle_t handle,
                                    const char *name,
                                    uint8_t channels,
                                    aes67_codec_t codec,
+                                   uint16_t packet_time_us,
                                    uint8_t *id)
 {
     if (!handle || !name || !id) {
@@ -159,7 +160,12 @@ esp_err_t aes67_session_add_source(aes67_session_handle_t handle,
 
     uint8_t word_length = aes67_codec_word_length(codec);
     uint32_t sample_rate = mgr->config.audio.sample_rate;
-    uint16_t packet_time = mgr->config.audio.packet_time_us;
+    uint16_t packet_time = packet_time_us ? packet_time_us : mgr->config.audio.packet_time_us;
+    if (packet_time < 125 || packet_time > 4000) {
+        xSemaphoreGive(mgr->lock);
+        ESP_LOGE(TAG, "packet time %u us out of range (125..4000)", packet_time);
+        return ESP_ERR_INVALID_ARG;
+    }
     uint16_t port = mgr->config.net.rtp_port;
 
     /* Compute multicast IP: base address + source index (network order).
@@ -405,13 +411,15 @@ esp_err_t aes67_session_add_sink(aes67_session_handle_t handle,
 
     xSemaphoreGive(mgr->lock);
 
+    char group_str[16];
+    aes67_net_u32_to_ip(sdp.connection_ip, group_str, sizeof(group_str));
     ESP_LOGI(TAG, "sink '%s' added (id=%d, %s/%luHz/%dch, wl=%d, ptime=%uus, "
              "mcast=%s:%u, pt=%u)",
              name, slot,
              aes67_codec_to_str(sdp.codec),
              (unsigned long)sdp.sample_rate, sdp.channels, sdp.word_length,
-             sdp.ptime_us,
-             sdp.session_name, sdp.port, sdp.payload_type);
+             rtp_cfg.packet_time_us,
+             group_str, sdp.port, sdp.payload_type);
     esp_event_post(AES67_EVENT, AES67_EVENT_SINK_ADDED, id, sizeof(*id), 0);
     ESP_LOGI(TAG, "sink SDP:\n%s", sdp_text);
     return ESP_OK;
@@ -617,14 +625,6 @@ int aes67_session_get_sink_count(aes67_session_handle_t handle)
     int count = mgr->sink_count;
     xSemaphoreGive(mgr->lock);
     return count;
-}
-
-void aes67_session_set_packet_time(aes67_session_handle_t handle, uint16_t ptime_us)
-{
-    if (handle && ptime_us > 0) {
-        struct aes67_session_mgr *mgr = handle;
-        mgr->config.audio.packet_time_us = ptime_us;
-    }
 }
 
 esp_err_t aes67_session_destroy(aes67_session_handle_t handle)

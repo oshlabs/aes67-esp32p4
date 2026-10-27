@@ -122,6 +122,13 @@ esp_err_t aes67_rtp_engine_stop(aes67_rtp_engine_handle_t handle);
 esp_err_t aes67_rtp_engine_destroy(aes67_rtp_engine_handle_t handle);
 
 /**
+ * Frames the TIC feeds into the source rings per tick (the node's packet
+ * time). Set before streams are added: a source whose packet is shorter
+ * than a tick still needs room for several ticks.
+ */
+void aes67_rtp_engine_set_tic_frames(aes67_rtp_engine_handle_t engine, uint32_t frames);
+
+/**
  * Add an RTP stream (source or sink). Returns a stream handle.
  */
 esp_err_t aes67_rtp_stream_add(aes67_rtp_engine_handle_t engine,

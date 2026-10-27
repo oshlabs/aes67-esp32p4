@@ -70,6 +70,7 @@ esp_err_t aes67_session_init(aes67_rtp_engine_handle_t rtp,
  * @param name      Stream name (used in SDP s= line)
  * @param channels  Number of channels (0 = use default)
  * @param codec     Audio codec (or -1 for default)
+ * @param packet_time_us  Packet time in microseconds (0 = node default)
  * @param id        Output: assigned stream ID
  * @return ESP_OK on success
  */
@@ -77,6 +78,7 @@ esp_err_t aes67_session_add_source(aes67_session_handle_t handle,
                                    const char *name,
                                    uint8_t channels,
                                    aes67_codec_t codec,
+                                   uint16_t packet_time_us,
                                    uint8_t *id);
 
 /**
@@ -138,11 +140,6 @@ int aes67_session_get_source_count(aes67_session_handle_t handle);
  * Get the number of active sinks.
  */
 int aes67_session_get_sink_count(aes67_session_handle_t handle);
-
-/**
- * Set the packet time for new source streams (does not affect existing).
- */
-void aes67_session_set_packet_time(aes67_session_handle_t handle, uint16_t ptime_us);
 
 /**
  * Destroy session manager and all streams.

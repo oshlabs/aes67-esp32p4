@@ -225,7 +225,7 @@ aes67_session_handle_t session;
 aes67_node_get_session(node, &session);
 
 uint8_t id;
-aes67_session_add_source(session, "My Source", 2, AES67_CODEC_L24, &id);
+aes67_session_add_source(session, "My Source", 2, AES67_CODEC_L24, 0 /* default ptime */, &id);
 
 /* Add a sink from discovered SDP */
 aes67_session_add_sink(session, "My Sink", remote_sdp_text, &id);
