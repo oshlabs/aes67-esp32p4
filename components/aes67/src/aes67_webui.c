@@ -352,7 +352,7 @@ static bool json_sinks_array(jbuf_t *jb, struct aes67_webui *ctx)
             ",\"codec\":\"%s\",\"sample_rate\":%lu,"
             "\"channels\":%u,\"ptime_us\":%u,\"packets_received\":%lu,"
             "\"packets_lost\":%lu,\"seq_errors\":%lu,\"jitter_us\":%ld,"
-            "\"ssrc\":%lu,\"ssrc_mismatches\":%lu,\"receiving\":%s}",
+            "\"ssrc\":%lu,\"ssrc_mismatches\":%lu,\"ssrc_relocks\":%lu,\"receiving\":%s}",
             codec_name(sink->rtp_config.codec),
             (unsigned long)sink->rtp_config.sample_rate,
             sink->rtp_config.channels,
@@ -363,6 +363,7 @@ static bool json_sinks_array(jbuf_t *jb, struct aes67_webui *ctx)
             (long)rtp_st.jitter_us,
             (unsigned long)rtp_st.ssrc,
             (unsigned long)rtp_st.ssrc_mismatches,
+            (unsigned long)rtp_st.ssrc_relocks,
             (rtp_st.status_flags & AES67_RTP_STATUS_RECEIVING) ? "true" : "false");
         if (!ok) {
             jb_rollback(jb, mark);

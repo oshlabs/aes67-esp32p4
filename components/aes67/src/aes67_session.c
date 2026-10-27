@@ -116,6 +116,31 @@ static uint32_t generate_ssrc(uint8_t stream_id)
     return hash;
 }
 
+/* A sink started or stopped receiving (engine timer task): post the event
+ * with the sink id, which applications and the web page key on */
+static void sink_rx_state_cb(aes67_rtp_stream_handle_t stream, bool active, void *user_data)
+{
+    struct aes67_session_mgr *mgr = user_data;
+    if (xSemaphoreTake(mgr->lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return;                     /* busy; the watcher reports again next time */
+    }
+    int found = -1;
+    for (int i = 0; i < CONFIG_AES67_MAX_SINKS; i++) {
+        if (mgr->sinks[i].enabled && mgr->sinks[i].rtp_stream == stream) {
+            found = i;
+            break;
+        }
+    }
+    xSemaphoreGive(mgr->lock);
+    if (found < 0) {
+        return;
+    }
+    uint8_t id = (uint8_t)found;
+    ESP_LOGI(TAG, "sink %u %s", id, active ? "receiving" : "receive timeout");
+    esp_event_post(AES67_EVENT, active ? AES67_EVENT_SINK_RX_ACTIVE : AES67_EVENT_SINK_RX_TIMEOUT,
+                   &id, sizeof(id), 0);
+}
+
 esp_err_t aes67_session_init(aes67_rtp_engine_handle_t rtp,
                              aes67_ptp_handle_t ptp,
                              aes67_sap_handle_t sap,
@@ -155,6 +180,7 @@ esp_err_t aes67_session_init(aes67_rtp_engine_handle_t rtp,
     memset(mgr->sources, 0, sizeof(mgr->sources));
     memset(mgr->sinks, 0, sizeof(mgr->sinks));
 
+    aes67_rtp_engine_set_rx_state_cb(mgr->rtp, sink_rx_state_cb, mgr);
     *handle = mgr;
     ESP_LOGI(TAG, "session manager initialized");
     return ESP_OK;

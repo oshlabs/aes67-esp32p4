@@ -81,6 +81,7 @@ typedef struct {
     uint16_t last_seq;              /* Last sequence number */
     uint32_t bytes_received;        /* Payload bytes decoded (sinks) */
     uint32_t ssrc_mismatches;       /* Packets on the group with another SSRC */
+    uint32_t ssrc_relocks;          /* Times the sink followed a new SSRC after silence */
     uint32_t ssrc;                  /* SSRC the sink is locked to (0 = none yet) */
 } aes67_rtp_stream_status_t;
 
@@ -127,6 +128,17 @@ esp_err_t aes67_rtp_engine_destroy(aes67_rtp_engine_handle_t handle);
  * than a tick still needs room for several ticks.
  */
 void aes67_rtp_engine_set_tic_frames(aes67_rtp_engine_handle_t engine, uint32_t frames);
+
+/**
+ * Receive-state notifications for sinks: `active` true when a sink's
+ * first packet (or the first after a timeout) arrived, false when it has
+ * been silent for AES67_RTP_RX_TIMEOUT_US. Called from the engine's timer
+ * task, not from the receive path. One callback per engine.
+ */
+#define AES67_RTP_RX_TIMEOUT_US 2000000
+typedef void (*aes67_rtp_rx_state_cb_t)(aes67_rtp_stream_handle_t stream, bool active, void *user_data);
+void aes67_rtp_engine_set_rx_state_cb(aes67_rtp_engine_handle_t engine,
+                                      aes67_rtp_rx_state_cb_t cb, void *user_data);
 
 /**
  * Add an RTP stream (source or sink). Returns a stream handle.

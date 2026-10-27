@@ -69,6 +69,7 @@ struct aes67_rtp_stream {
     uint8_t *tx_packet_buf;     /* Scratch buffer for packet assembly (internal SRAM) */
     bool active;
     bool first_packet;          /* True until first RTP packet received (sinks) */
+    bool rx_reported_active;    /* last state given to the rx-state callback */
     /* Codec conversion function pointers (MTConvert pattern).
      * Resolved once at stream creation, called per-packet with no branching. */
     aes67_convert_to_net_fn convert_to_net;
@@ -110,6 +111,11 @@ struct aes67_rtp_engine {
     bool use_psram;
     aes67_net_config_t net_config;
     uint32_t tic_frames;            /* frames the TIC feeds per tick (sizes source rings) */
+    /* Sink receive-state watcher: a periodic timer compares each sink's
+     * last arrival with now and reports transitions */
+    esp_timer_handle_t rx_watch;
+    aes67_rtp_rx_state_cb_t rx_state_cb;
+    void *rx_state_user;
     /* Direct I2S playback from RX task */
     bool i2s_playback_enabled;
     void *audio_handle;
@@ -799,6 +805,46 @@ StreamBufferHandle_t aes67_rtp_engine_get_stream_buf(aes67_rtp_engine_handle_t h
     return handle ? handle->audio_stream_buf : NULL;
 }
 
+void aes67_rtp_engine_set_rx_state_cb(aes67_rtp_engine_handle_t handle,
+                                      aes67_rtp_rx_state_cb_t cb, void *user_data)
+{
+    if (handle) {
+        handle->rx_state_cb = cb;
+        handle->rx_state_user = user_data;
+    }
+}
+
+/* Periodic (250 ms, esp_timer task): report sinks that started or stopped
+ * receiving. The frame path only records arrival times, so the transition
+ * to silence has to be noticed here. */
+static void rx_watch_cb(void *arg)
+{
+    struct aes67_rtp_engine *engine = arg;
+    if (!engine->rx_state_cb) {
+        return;
+    }
+    int64_t now_us = esp_timer_get_time();
+    for (int i = 0; i < AES67_MAX_STREAMS; i++) {
+        struct aes67_rtp_stream *s;
+        bool active, reported, changed = false;
+        portENTER_CRITICAL(&engine->rx_lock);
+        s = engine->streams[i];
+        if (s && s->direction == AES67_STREAM_SINK) {
+            active = s->last_rx_time_us > 0 &&
+                     now_us - s->last_rx_time_us < AES67_RTP_RX_TIMEOUT_US;
+            reported = s->rx_reported_active;
+            if (active != reported) {
+                s->rx_reported_active = active;
+                changed = true;
+            }
+        }
+        portEXIT_CRITICAL(&engine->rx_lock);
+        if (changed) {
+            engine->rx_state_cb(s, active, engine->rx_state_user);
+        }
+    }
+}
+
 void aes67_rtp_engine_set_tic_frames(aes67_rtp_engine_handle_t handle, uint32_t frames)
 {
     if (handle) {
@@ -857,6 +903,20 @@ esp_err_t aes67_rtp_engine_start(aes67_rtp_engine_handle_t handle)
         return ESP_FAIL;
     }
 
+    if (!engine->rx_watch) {
+        const esp_timer_create_args_t args = {
+            .callback = rx_watch_cb,
+            .arg = engine,
+            .name = "aes67_rxw",
+        };
+        if (esp_timer_create(&args, &engine->rx_watch) != ESP_OK) {
+            ESP_LOGW(TAG, "receive-state watcher not created");
+        }
+    }
+    if (engine->rx_watch) {
+        esp_timer_start_periodic(engine->rx_watch, 250000);
+    }
+
     ESP_LOGI(TAG, "Engine started");
     return ESP_OK;
 }
@@ -873,6 +933,9 @@ esp_err_t aes67_rtp_engine_stop(aes67_rtp_engine_handle_t handle)
     }
 
     engine->running = false;
+    if (engine->rx_watch) {
+        esp_timer_stop(engine->rx_watch);
+    }
 
     /* The RX task sees the flag on its next 100 ms receive timeout and
      * signals rx_done on the way out; wait for that instead of guessing. */
@@ -894,6 +957,11 @@ esp_err_t aes67_rtp_engine_destroy(aes67_rtp_engine_handle_t handle)
     }
 
     struct aes67_rtp_engine *engine = handle;
+    if (engine->rx_watch) {
+        esp_timer_stop(engine->rx_watch);
+        esp_timer_delete(engine->rx_watch);
+        engine->rx_watch = NULL;
+    }
 
     /* Stop if still running */
     if (engine->running) {
@@ -1282,16 +1350,26 @@ bool IRAM_ATTR aes67_rtp_engine_rx_frame(aes67_rtp_engine_handle_t handle,
     uint32_t ts = ((uint32_t)rtp[4] << 24) | ((uint32_t)rtp[5] << 16) |
                   ((uint32_t)rtp[6] << 8) | rtp[7];
 
-    /* SSRC: lock to the first sender on this group, then stay with it */
+    /* SSRC: lock to the first sender on this group and stay with it while
+     * it is sending. A different SSRC is accepted once the locked one has
+     * been silent for the timeout: the source restarted (senders pick a
+     * new SSRC) and the sink follows without being re-subscribed. */
+    int64_t now_us = esp_timer_get_time();
     if (s->first_packet) {
         s->ssrc = ssrc;
         s->first_packet = false;
     } else if (s->ssrc != ssrc) {
-        s->status.ssrc_mismatches++;
-        s->status.status_flags |= AES67_RTP_STATUS_SSRC_ERROR;
-        engine->rx_stats.ssrc_rejected++;
-        portEXIT_CRITICAL(&engine->rx_lock);
-        return true;                                    /* ours, but not this sender */
+        if (now_us - s->last_rx_time_us > AES67_RTP_RX_TIMEOUT_US) {
+            s->ssrc = ssrc;
+            s->status.ssrc_relocks++;
+            s->status.last_seq = (uint16_t)(seq - 1);   /* no loss across the restart */
+        } else {
+            s->status.ssrc_mismatches++;
+            s->status.status_flags |= AES67_RTP_STATUS_SSRC_ERROR;
+            engine->rx_stats.ssrc_rejected++;
+            portEXIT_CRITICAL(&engine->rx_lock);
+            return true;                                /* ours, but not this sender */
+        }
     }
 
     uint8_t channels = s->config.channels;
@@ -1302,7 +1380,6 @@ bool IRAM_ATTR aes67_rtp_engine_rx_frame(aes67_rtp_engine_handle_t handle,
     if (frames > RX_SCRATCH_FRAMES) frames = RX_SCRATCH_FRAMES;
 
     /* Statistics: sequence, loss, inter-arrival jitter */
-    int64_t now_us = esp_timer_get_time();
     if (s->status.packets_received > 0) {
         uint16_t expected = (uint16_t)(s->status.last_seq + 1);
         if (seq != expected) {
