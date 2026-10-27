@@ -22,6 +22,7 @@
 #include "aes67_net.h"
 #include "aes67_eth_rx.h"
 #include "aes67_clock.h"
+#include "aes67_mdns.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -37,10 +38,6 @@
 #include "driver/i2s_std.h"
 
 static const char *TAG = "aes67";
-
-/* mDNS init/deinit -- declared here since aes67_mdns.c has no header */
-esp_err_t aes67_mdns_init(const char *node_name, uint16_t rtp_port);
-void aes67_mdns_deinit(void);
 
 /* Define the event base for the ESP event loop */
 ESP_EVENT_DEFINE_BASE(AES67_EVENT);
@@ -610,7 +607,7 @@ esp_err_t aes67_node_start(aes67_node_handle_t handle)
 
     /* mDNS advertisement (optional) */
     if (handle->config.mdns_enabled) {
-        ret = aes67_mdns_init(handle->config.node_name, handle->config.net.rtp_port);
+        ret = aes67_mdns_init(&handle->config);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "mDNS init failed: %s (continuing without mDNS)",
                      esp_err_to_name(ret));

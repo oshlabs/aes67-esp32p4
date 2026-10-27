@@ -69,7 +69,8 @@ An ESP-IDF component implementing the AES67 (and RAVENNA-compatible) audio-over-
   - PTP reference clock attributes (`a=ts-refclk`)
   - Media clock attributes (`a=mediaclk`)
   - Fractional ptime support for sub-millisecond packet times
-- **mDNS/DNS-SD** service advertisement (`_ravenna._udp`)
+- **mDNS/DNS-SD** device advertisement (`_ravenna._udp`, TXT from the configuration; no
+  `_rtsp._tcp`, as no RTSP server runs here, streams are found over SAP)
 - **I2S audio** driver with APLL clock
   - Standard I2S Philips mode, 32-bit slots
   - APLL for exact 48kHz (18.432MHz MCLK)
