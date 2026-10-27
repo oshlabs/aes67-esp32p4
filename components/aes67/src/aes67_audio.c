@@ -183,6 +183,8 @@ static void playback_ring_to_dma(struct aes67_audio_ctx *ctx,
 static StreamBufferHandle_t s_isr_stream_buf = NULL;
 #define AES67_AUDIO_STREAM_BUF_BYTES 65536   /* ~170 ms of stereo int32 at 48 kHz */
 static StreamBufferHandle_t s_capture_stream_buf = NULL;
+/* Task to wake once when the next capture chunk has landed (one-shot) */
+static TaskHandle_t volatile s_capture_waiter = NULL;
 
 /* ISR diagnostics: interval counters reset by aes67_audio_log_isr_stats()
  * and totals that are never reset */
@@ -398,6 +400,11 @@ static IRAM_ATTR bool on_i2s_rx_recv(i2s_chan_handle_t handle,
         BaseType_t woken = pdFALSE;
         xStreamBufferSendFromISR(s_capture_stream_buf, event->dma_buf,
                                   event->size, &woken);
+        TaskHandle_t waiter = s_capture_waiter;
+        if (waiter) {
+            s_capture_waiter = NULL;
+            vTaskNotifyGiveFromISR(waiter, &woken);
+        }
         return woken == pdTRUE;
     }
     return false;
@@ -408,6 +415,12 @@ StreamBufferHandle_t aes67_audio_get_capture_buf(aes67_audio_handle_t handle)
 {
     (void)handle;
     return s_capture_stream_buf;
+}
+
+void aes67_audio_capture_notify_once(aes67_audio_handle_t handle, TaskHandle_t task)
+{
+    (void)handle;
+    s_capture_waiter = task;
 }
 
 

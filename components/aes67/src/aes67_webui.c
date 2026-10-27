@@ -934,6 +934,16 @@ static int build_status_frame(struct aes67_webui *ctx, char *buf, size_t cap)
     jb_printf(&jb, ",\"controls\":");
     complete &= json_controls_array(&jb, ctx);
 
+    /* Frame task and timer counters */
+    aes67_node_tic_stats_t tic = {0};
+    aes67_node_get_tic_stats(ctx->node, &tic);
+    jb_printf(&jb, ",\"tic\":{\"ticks\":%lu,\"catchups\":%lu,\"deferrals\":%lu,\"stalls\":%lu,"
+              "\"capture_backlog\":%lu,\"timer_fires\":%lu,\"timer_reanchors\":%lu,\"timer_rearms\":%lu}",
+              (unsigned long)tic.ticks, (unsigned long)tic.catchups, (unsigned long)tic.deferrals,
+              (unsigned long)tic.stalls, (unsigned long)tic.capture_backlog_frames,
+              (unsigned long)tic.timer_fires, (unsigned long)tic.timer_reanchors,
+              (unsigned long)tic.timer_rearms);
+
     /* Receive-path counters from the node */
     aes67_node_rx_stats_t rx = {0};
     aes67_node_get_rx_stats(ctx->node, &rx);

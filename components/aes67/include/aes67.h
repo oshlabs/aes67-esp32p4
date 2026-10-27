@@ -127,6 +127,21 @@ typedef struct {
 
 esp_err_t aes67_node_get_rx_stats(aes67_node_handle_t handle, aes67_node_rx_stats_t *stats);
 
+/* Frame task (TIC) and hardware frame timer counters */
+typedef struct {
+    uint32_t ticks;                 /* frame periods processed */
+    uint32_t catchups;              /* ticks processed late, after a lost wake-up */
+    uint32_t deferrals;             /* ticks that waited for the capture chunk to land */
+    uint32_t stalls;                /* timer silent or too far behind; capture backlog dropped */
+    uint32_t stalls_logged;         /* internal */
+    uint32_t capture_backlog_frames;/* captured frames waiting (constant once the clock is locked) */
+    uint32_t timer_fires;           /* hardware frame timer interrupts */
+    uint32_t timer_reanchors;       /* timer target skipped ahead */
+    uint32_t timer_rearms;          /* timer re-armed after a stall */
+} aes67_node_tic_stats_t;
+
+esp_err_t aes67_node_get_tic_stats(aes67_node_handle_t handle, aes67_node_tic_stats_t *stats);
+
 /* Audio clock recovery: how the APLL is tracking PTP */
 #include "aes67_clock.h"
 esp_err_t aes67_node_get_clock_status(aes67_node_handle_t handle, aes67_clock_status_t *status);

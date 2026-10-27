@@ -66,6 +66,9 @@ struct aes67_node {
 /* Global node pointer for the ISR callback (single instance) */
 static aes67_node_handle_t s_node = NULL;
 
+/* Frame task counters, read by aes67_node_get_tic_stats() (single writer) */
+static aes67_node_tic_stats_t s_tic_stats;
+
 /*
  * Hardware PTP timer ISR callback. Fires at exact PTP-clock-aligned
  * audio frame boundaries and wakes the TIC task. The wake-up is only a
@@ -129,9 +132,11 @@ static void audio_frame_task(void *arg)
     const TickType_t wait_ticks = pdMS_TO_TICKS((period_ns * 2) / 1000000 < 2 ? 2 : (period_ns * 2) / 1000000);
     uint64_t last_boundary_ns = 0;      /* PTP time of the last processed frame boundary */
     uint32_t missed_waits = 0;
-    uint32_t catchups = 0, stalls = 0;
+    uint32_t catchups = 0, stalls = 0, deferrals = 0;
+    int64_t last_stall_log_us = 0;
 
     s_tic_task = xTaskGetCurrentTaskHandle();
+    memset(&s_tic_stats, 0, sizeof(s_tic_stats));
 
     while (node->running) {
         /* Wait for the hardware PTP frame timer ISR */
@@ -183,12 +188,17 @@ static void audio_frame_task(void *arg)
         for (uint32_t k = 0; k < due; k++) {
             /* A tick is processed only once its packet of captured audio
              * is complete. The capture DMA delivers 16-frame chunks, so a
-             * wake-up that is a little late can find the newest packet
-             * short; sending nothing in that slot would leave a sequence
-             * gap. Defer this and the following ticks to the next wake-up. */
+             * tick can find the newest packet one chunk short (with the
+             * audio clock locked to PTP the chunk may land just after
+             * every tick); sending nothing in that slot would leave a
+             * sequence gap. Defer this and the following ticks and ask the
+             * capture ISR for a wake-up when the chunk has landed, at most
+             * one chunk period away, rather than wait a whole frame period. */
             if (cap_buf && cap_samples) {
                 if (xStreamBufferBytesAvailable(cap_buf) < need) {
                     last_boundary_ns = boundary_ns - (uint64_t)(due - k) * period_ns;
+                    aes67_audio_capture_notify_once(node->audio, s_tic_task);
+                    deferrals++;
                     break;
                 }
                 xStreamBufferReceive(cap_buf, cap_samples, need, 0);
@@ -209,15 +219,23 @@ static void audio_frame_task(void *arg)
             aes67_rtp_engine_process_tx(node->rtp, rtp_ts);
         }
 
-        /* Once a minute, account for what the reconstruction did */
-        if ((frame_count % 60000) == 0 && (catchups || stalls)) {
-            aes67_hw_timer_stats_t ts;
-            aes67_hw_timer_get_stats(&ts);
-            ESP_LOGI(TAG, "TIC: %lu ticks, %lu caught up, %lu stalls; timer fires %lu, "
-                     "re-anchors %lu, re-arms %lu",
-                     (unsigned long)frame_count, (unsigned long)catchups,
-                     (unsigned long)stalls, (unsigned long)ts.fires,
-                     (unsigned long)ts.reanchors, (unsigned long)ts.rearms);
+        /* Publish the counters; nothing is logged from here in steady
+         * state, since a log line on the console holds this task for
+         * longer than several frame periods. A stall is worth a (short,
+         * rate-limited) warning. */
+        s_tic_stats.ticks = frame_count;
+        s_tic_stats.catchups = catchups;
+        s_tic_stats.deferrals = deferrals;
+        s_tic_stats.stalls = stalls;
+        s_tic_stats.capture_backlog_frames = cap_buf
+            ? xStreamBufferBytesAvailable(cap_buf) / (node->config.audio.channels * sizeof(int32_t)) : 0;
+        if (stalls != s_tic_stats.stalls_logged) {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_stall_log_us > 10000000) {
+                last_stall_log_us = now_us;
+                ESP_LOGW(TAG, "TIC stall %lu", (unsigned long)stalls);
+            }
+            s_tic_stats.stalls_logged = stalls;
         }
     }
 
@@ -795,6 +813,20 @@ esp_err_t aes67_node_get_rtp(aes67_node_handle_t handle,
     }
 
     *rtp = handle->rtp;
+    return ESP_OK;
+}
+
+esp_err_t aes67_node_get_tic_stats(aes67_node_handle_t handle, aes67_node_tic_stats_t *stats)
+{
+    if (!handle || !stats) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *stats = s_tic_stats;
+    aes67_hw_timer_stats_t ts = {0};
+    aes67_hw_timer_get_stats(&ts);
+    stats->timer_fires = ts.fires;
+    stats->timer_reanchors = ts.reanchors;
+    stats->timer_rearms = ts.rearms;
     return ESP_OK;
 }
 

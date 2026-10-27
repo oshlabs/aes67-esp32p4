@@ -147,6 +147,13 @@ void aes67_audio_log_isr_stats(void);
 StreamBufferHandle_t aes67_audio_get_capture_buf(aes67_audio_handle_t handle);
 
 /**
+ * Give `task` one task notification when the next capture DMA chunk has
+ * been written to the capture buffer (one-shot; NULL cancels). Lets the
+ * frame task wait for the last chunk of a packet instead of a whole period.
+ */
+void aes67_audio_capture_notify_once(aes67_audio_handle_t handle, TaskHandle_t task);
+
+/**
  * Reference clock the TX DMA ISR stamps its playout snapshots with
  * (nanoseconds; must be callable from an ISR). Set by the clock-recovery
  * loop before the audio is started; NULL disables the snapshots.
