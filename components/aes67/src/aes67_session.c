@@ -49,6 +49,48 @@ struct aes67_session_mgr {
     SemaphoreHandle_t lock;
 };
 
+/* Reference clock attributes from the current PTP state: the grandmaster
+ * identity and domain when locked, "traceable" when that grandmaster is
+ * itself locked to a primary reference (clockClass 6) or in holdover from
+ * one (7). Nothing is claimed while not locked. */
+static void fill_refclk(struct aes67_session_mgr *mgr, aes67_sdp_t *sdp)
+{
+    sdp->has_ptp_refclk = false;
+    sdp->ptp_traceable = false;
+    sdp->ptp_domain = mgr->config.ptp.domain;
+    memset(sdp->ptp_grandmaster_id, 0, sizeof(sdp->ptp_grandmaster_id));
+
+    aes67_ptp_status_t st;
+    if (aes67_ptp_get_status(mgr->ptp, &st) != ESP_OK || st.lock_state != AES67_PTP_LOCKED) {
+        return;
+    }
+    bool gm_valid = false;
+    for (int i = 0; i < 8; i++) {
+        if (st.grandmaster_id[i] != 0) { gm_valid = true; break; }
+    }
+    if (!gm_valid) {
+        return;
+    }
+    memcpy(sdp->ptp_grandmaster_id, st.grandmaster_id, 8);
+    sdp->has_ptp_refclk = true;
+    sdp->ptp_domain = st.domain;
+    sdp->ptp_traceable = st.master_clock_class <= 7;
+}
+
+/* CRC-16 of the SDP text, the SAP message id hash (Linux daemon convention) */
+static uint16_t sdp_msg_id(const char *sdp_text, int len)
+{
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < len; i++) {
+        crc ^= (uint8_t)sdp_text[i];
+        for (int b = 0; b < 8; b++) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
+        }
+    }
+    return crc;
+}
+
 /* Generate a deterministic SSRC from MAC address and stream ID */
 static uint32_t generate_ssrc(uint8_t stream_id)
 {
@@ -222,28 +264,10 @@ esp_err_t aes67_session_add_source(aes67_session_handle_t handle,
     sdp.word_length = word_length;
     sdp.ptime_us = packet_time;
 
-    /* PTP reference clock. At stream creation time we may not have
-     * synced to a GM yet, so default to "traceable" which is what
-     * most AES67 devices advertise. The SDP will be re-announced
-     * via SAP periodically, picking up the current GM state. */
+    /* Reference clock as PTP stands now; aes67_session_refresh_sdp()
+     * regenerates and re-announces when the lock state changes */
     sdp.is_source = true;  /* This is a TX source: a=sendonly */
-    sdp.has_ptp_refclk = true;
-    sdp.ptp_traceable = true;
-    sdp.ptp_domain = mgr->config.ptp.domain;
-
-    aes67_ptp_status_t ptp_status;
-    if (aes67_ptp_get_status(mgr->ptp, &ptp_status) == ESP_OK &&
-        ptp_status.lock_state == AES67_PTP_LOCKED) {
-        /* If we have a locked GM, include its identity */
-        bool gm_valid = false;
-        for (int i = 0; i < 8; i++) {
-            if (ptp_status.grandmaster_id[i] != 0) { gm_valid = true; break; }
-        }
-        if (gm_valid) {
-            memcpy(sdp.ptp_grandmaster_id, ptp_status.grandmaster_id, 8);
-            sdp.ptp_traceable = true;
-        }
-    }
+    fill_refclk(mgr, &sdp);
 
     /* Media clock offset */
     sdp.has_mediaclk = true;
@@ -268,17 +292,9 @@ esp_err_t aes67_session_add_source(aes67_session_handle_t handle,
         return err;
     }
 
-    /* Compute CRC16 of the SDP text as the SAP message ID hash,
-     * matching the Linux daemon convention. Always compute so we can
-     * store it for later use during SAP delete. */
-    uint16_t msg_crc = 0xFFFF;
-    for (int i = 0; i < sdp_len; i++) {
-        msg_crc ^= (uint8_t)sdp_text[i];
-        for (int b = 0; b < 8; b++) {
-            if (msg_crc & 1) msg_crc = (msg_crc >> 1) ^ 0xA001;
-            else msg_crc >>= 1;
-        }
-    }
+    /* The SAP message id: a hash of the first SDP text, kept for the
+     * source's lifetime so receivers see updates as the same session */
+    uint16_t msg_crc = sdp_msg_id(sdp_text, sdp_len);
 
     /* SAP announcement if enabled */
     if (mgr->config.sap_enabled && mgr->sap) {
@@ -625,6 +641,55 @@ int aes67_session_get_sink_count(aes67_session_handle_t handle)
     int count = mgr->sink_count;
     xSemaphoreGive(mgr->lock);
     return count;
+}
+
+esp_err_t aes67_session_refresh_sdp(aes67_session_handle_t handle)
+{
+    if (!handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    struct aes67_session_mgr *mgr = handle;
+    if (!mgr->config.sap_enabled || !mgr->sap) {
+        return ESP_OK;
+    }
+    char *sdp_text = malloc(AES67_SDP_MAX_LEN);
+    if (!sdp_text) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(mgr->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        free(sdp_text);
+        return ESP_ERR_TIMEOUT;
+    }
+    uint32_t local_ip = 0;
+    aes67_net_get_local_ip(&local_ip);
+    int refreshed = 0;
+    for (int i = 0; i < CONFIG_AES67_MAX_SOURCES; i++) {
+        aes67_source_t *src = &mgr->sources[i];
+        if (!src->enabled) {
+            continue;
+        }
+        aes67_sdp_t before = src->sdp;
+        fill_refclk(mgr, &src->sdp);
+        if (before.has_ptp_refclk == src->sdp.has_ptp_refclk &&
+            before.ptp_traceable == src->sdp.ptp_traceable &&
+            before.ptp_domain == src->sdp.ptp_domain &&
+            memcmp(before.ptp_grandmaster_id, src->sdp.ptp_grandmaster_id, 8) == 0) {
+            continue;                       /* nothing changed for this source */
+        }
+        src->sdp.session_version++;         /* o= version: the description changed */
+        int len = aes67_sdp_generate(&src->sdp, sdp_text, AES67_SDP_MAX_LEN);
+        if (len > 0) {
+            aes67_sap_announce(mgr->sap, src->sap_msg_id, local_ip, sdp_text);
+            refreshed++;
+        }
+    }
+    xSemaphoreGive(mgr->lock);
+    free(sdp_text);
+    if (refreshed) {
+        ESP_LOGI(TAG, "%d source SDP%s re-announced with the current PTP reference",
+                 refreshed, refreshed == 1 ? "" : "s");
+    }
+    return ESP_OK;
 }
 
 esp_err_t aes67_session_destroy(aes67_session_handle_t handle)

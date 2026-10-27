@@ -51,10 +51,14 @@ typedef struct {
     /* Packet time (a=ptime) and, when the SDP says so, the exact frame
      * count (a=framecount; RAVENNA). The frame count wins: a ptime of
      * 0.333 is a rounded 16 frames. */
-    uint16_t ptime_us;                  /* Packet time in microseconds */
+    uint32_t ptime_us;                  /* Packet time in microseconds */
     uint16_t framecount;                /* Frames per packet, 0 if not given */
 
-    /* PTP reference clock (a=ts-refclk) */
+    /* PTP reference clock (a=ts-refclk). Generating: with has_ptp_refclk
+     * the grandmaster identity and domain are written, and "traceable"
+     * additionally when ptp_traceable (the grandmaster is locked to a
+     * primary reference such as GPS). Parsing: has_ptp_refclk is set when
+     * an identity was given, ptp_traceable when "traceable" was. */
     bool has_ptp_refclk;
     uint8_t ptp_grandmaster_id[8];
     uint8_t ptp_domain;

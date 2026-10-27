@@ -409,6 +409,11 @@ static void playback_task(void *arg)
  */
 static void node_ptp_lock_cb(aes67_ptp_lock_state_t state, void *user_data)
 {
+    aes67_node_handle_t node = (aes67_node_handle_t)user_data;
+    /* The sources' SDPs name the grandmaster we are locked to */
+    if (node && node->session) {
+        aes67_session_refresh_sdp(node->session);
+    }
     aes67_event_t ev = (state == AES67_PTP_LOCKED) ? AES67_EVENT_PTP_LOCKED
                                                    : AES67_EVENT_PTP_UNLOCKED;
     esp_err_t err = esp_event_post(AES67_EVENT, ev, &state, sizeof(state), 0);

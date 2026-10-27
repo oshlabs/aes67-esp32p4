@@ -142,6 +142,14 @@ int aes67_session_get_source_count(aes67_session_handle_t handle);
 int aes67_session_get_sink_count(aes67_session_handle_t handle);
 
 /**
+ * Regenerate every source's SDP from the current PTP state (grandmaster
+ * identity, domain, traceability) and re-announce the ones that changed,
+ * with a bumped o= version and the same SAP message id. The node calls
+ * this on PTP lock transitions.
+ */
+esp_err_t aes67_session_refresh_sdp(aes67_session_handle_t handle);
+
+/**
  * Destroy session manager and all streams.
  */
 esp_err_t aes67_session_destroy(aes67_session_handle_t handle);

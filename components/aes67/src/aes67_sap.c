@@ -690,8 +690,8 @@ esp_err_t aes67_sap_announce(aes67_sap_handle_t handle,
     ESP_LOGI(TAG, "%s local source announcement (id=0x%04X)",
              updated ? "Updated" : "Added", msg_id);
 
-    /* Send an immediate announcement if already running */
-    if (!updated && handle->running && handle->sock >= 0) {
+    /* Send it at once if already running (a new source, or a changed one) */
+    if (handle->running && handle->sock >= 0) {
         uint8_t pkt[SAP_RX_BUF_SIZE];
         int pkt_len = build_sap_packet(pkt, sizeof(pkt),
                                        SAP_ANNOUNCE_FLAG,

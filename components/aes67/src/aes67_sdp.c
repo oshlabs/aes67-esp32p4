@@ -36,11 +36,12 @@ const char *aes67_codec_to_str(aes67_codec_t codec)
 
 int aes67_codec_from_str(const char *name)
 {
+    /* Encoding names are case-insensitive (RFC 4566) */
     if (!name) return -1;
-    if (strcmp(name, "L16") == 0)   return AES67_CODEC_L16;
-    if (strcmp(name, "L24") == 0)   return AES67_CODEC_L24;
-    if (strcmp(name, "L32") == 0)   return AES67_CODEC_L32;
-    if (strcmp(name, "AM824") == 0) return AES67_CODEC_AM824;
+    if (strcasecmp(name, "L16") == 0)   return AES67_CODEC_L16;
+    if (strcasecmp(name, "L24") == 0)   return AES67_CODEC_L24;
+    if (strcasecmp(name, "L32") == 0)   return AES67_CODEC_L32;
+    if (strcasecmp(name, "AM824") == 0) return AES67_CODEC_AM824;
     return -1;
 }
 
@@ -63,11 +64,11 @@ int aes67_sdp_generate(const aes67_sdp_t *sdp, char *buf, size_t buf_len)
     /* Build ptime string. AES67 uses fractional ms for sub-ms packet times. */
     char ptime_str[16];
     if (sdp->ptime_us >= 1000 && (sdp->ptime_us % 1000) == 0) {
-        snprintf(ptime_str, sizeof(ptime_str), "%u", sdp->ptime_us / 1000);
+        snprintf(ptime_str, sizeof(ptime_str), "%lu", (unsigned long)(sdp->ptime_us / 1000));
     } else if (sdp->ptime_us >= 1000) {
         /* e.g. 1500us -> "1.5" */
-        snprintf(ptime_str, sizeof(ptime_str), "%u.%03u",
-                 sdp->ptime_us / 1000, sdp->ptime_us % 1000);
+        snprintf(ptime_str, sizeof(ptime_str), "%lu.%03lu",
+                 (unsigned long)(sdp->ptime_us / 1000), (unsigned long)(sdp->ptime_us % 1000));
         /* Strip trailing zeros after decimal point */
         size_t len = strlen(ptime_str);
         while (len > 0 && ptime_str[len - 1] == '0') {
@@ -75,7 +76,7 @@ int aes67_sdp_generate(const aes67_sdp_t *sdp, char *buf, size_t buf_len)
         }
     } else {
         /* Sub-millisecond: e.g. 125us -> "0.125" */
-        snprintf(ptime_str, sizeof(ptime_str), "0.%03u", sdp->ptime_us);
+        snprintf(ptime_str, sizeof(ptime_str), "0.%03lu", (unsigned long)sdp->ptime_us);
         size_t len = strlen(ptime_str);
         while (len > 0 && ptime_str[len - 1] == '0') {
             ptime_str[--len] = '\0';
@@ -126,23 +127,27 @@ int aes67_sdp_generate(const aes67_sdp_t *sdp, char *buf, size_t buf_len)
         return -1;
     }
 
-    /* Append PTP reference clock attribute.
-     * Use "traceable" when the GM is known and traceable,
-     * otherwise include the specific GM identity. */
+    /* Reference clock (RFC 7273): the grandmaster this node is locked to,
+     * with its domain, so a receiver can check it shares the clock; and
+     * "traceable" as well when that grandmaster follows a primary
+     * reference, so a receiver on another traceable grandmaster can still
+     * align. Nothing is claimed while not locked. */
     if (sdp->has_ptp_refclk) {
-        int n;
-        if (sdp->ptp_traceable) {
-            n = snprintf(buf + written, buf_len - written,
-                         "a=ts-refclk:ptp=IEEE1588-2008:traceable\r\n");
-        } else {
-            n = snprintf(buf + written, buf_len - written,
+        int n = snprintf(buf + written, buf_len - written,
                          "a=ts-refclk:ptp=IEEE1588-2008:%s:%u\r\n",
                          ptp_gm_str, sdp->ptp_domain);
-        }
         if (n < 0 || (size_t)(written + n) >= buf_len) {
             return -1;
         }
         written += n;
+        if (sdp->ptp_traceable) {
+            n = snprintf(buf + written, buf_len - written,
+                         "a=ts-refclk:ptp=IEEE1588-2008:traceable\r\n");
+            if (n < 0 || (size_t)(written + n) >= buf_len) {
+                return -1;
+            }
+            written += n;
+        }
     }
 
     /* Append media clock attribute */
@@ -188,13 +193,13 @@ static bool parse_ptp_gmid(const char *str, uint8_t gm[8])
 }
 
 /* Parse ptime value which may be fractional (e.g. "1", "0.125", "1.5") */
-static uint16_t parse_ptime_us(const char *str)
+static uint32_t parse_ptime_us(const char *str)
 {
     /* Split on decimal point */
     const char *dot = strchr(str, '.');
     if (!dot) {
         /* Integer milliseconds */
-        return (uint16_t)(atoi(str) * 1000);
+        return (uint32_t)(strtoul(str, NULL, 10) * 1000);
     }
 
     /* Integer part in ms */
@@ -215,7 +220,7 @@ static uint16_t parse_ptime_us(const char *str)
         digits++;
     }
 
-    return (uint16_t)(integer_ms * 1000 + frac_val);
+    return (uint32_t)(integer_ms * 1000 + frac_val);
 }
 
 /* Parse a=rtpmap line, e.g. "98 L24/48000/2" */
@@ -232,34 +237,41 @@ static void parse_rtpmap(const char *val, aes67_sdp_t *sdp)
         if (codec >= 0) {
             sdp->codec = (aes67_codec_t)codec;
             sdp->word_length = aes67_codec_word_length(sdp->codec);
+        } else {
+            ESP_LOGW(TAG, "rtpmap: unknown encoding \"%s\"", codec_name);
+            sdp->codec = (aes67_codec_t)-1;
         }
         sdp->sample_rate = rate;
-        sdp->channels = (matched >= 4) ? (uint8_t)ch : 1;
+        sdp->channels = (matched >= 4) ? (uint8_t)(ch > 255 ? 255 : ch) : 1;
     }
 }
 
-/* Parse a=ts-refclk line, e.g. "ptp=IEEE1588-2008:XX-XX-...:0" */
+/* Parse a=ts-refclk (RFC 7273): "ptp=IEEE1588-2008:XX-...-XX:0",
+ * "ptp=IEEE1588-2008:traceable", the 2002 and 2019 editions likewise, or
+ * the bare "ptp=traceable". An SDP may carry several; identity and
+ * traceability accumulate. */
 static void parse_ts_refclk(const char *val, aes67_sdp_t *sdp)
 {
-    /* Check for PTP reference clock */
-    if (strncmp(val, "ptp=IEEE1588-2008:", 18) != 0) {
-        /* Could be "ptp=traceable" */
-        if (strcmp(val, "ptp=traceable") == 0) {
-            sdp->has_ptp_refclk = true;
-            sdp->ptp_traceable = true;
-        }
+    if (strcmp(val, "ptp=traceable") == 0) {
+        sdp->ptp_traceable = true;
         return;
     }
-
-    const char *gm_start = val + 18;
-    if (parse_ptp_gmid(gm_start, sdp->ptp_grandmaster_id)) {
-        sdp->has_ptp_refclk = true;
+    if (strncmp(val, "ptp=IEEE1588-20", 15) != 0 || strlen(val) < 18 || val[17] != ':') {
+        return;                                 /* another clock type */
     }
-
-    /* Parse domain after the GM ID: "XX-XX-XX-XX-XX-XX-XX-XX:0" */
-    const char *colon = strchr(gm_start + 23, ':');
-    if (colon) {
-        sdp->ptp_domain = (uint8_t)atoi(colon + 1);
+    const char *rest = val + 18;
+    if (strncmp(rest, "traceable", 9) == 0) {
+        sdp->ptp_traceable = true;
+        return;
+    }
+    if (strlen(rest) < 23 || !parse_ptp_gmid(rest, sdp->ptp_grandmaster_id)) {
+        ESP_LOGW(TAG, "ts-refclk: unreadable grandmaster identity");
+        return;
+    }
+    sdp->has_ptp_refclk = true;
+    if (rest[23] == ':') {
+        unsigned long d = strtoul(rest + 24, NULL, 10);
+        sdp->ptp_domain = d > 127 ? 0 : (uint8_t)d;
     }
 }
 
@@ -395,21 +407,50 @@ esp_err_t aes67_sdp_parse(const char *sdp_text, aes67_sdp_t *sdp)
         line = strtok_r(NULL, "\n", &saveptr);
     }
 
-    /* Sanity check: at minimum we need a port and sample rate */
-    if (sdp->port == 0 || sdp->sample_rate == 0) {
-        ESP_LOGW(TAG, "SDP parse incomplete: port=%u rate=%u",
-                 sdp->port, sdp->sample_rate);
+    /* Validate what a stream will be built from, naming what is wrong */
+    if (sdp->port == 0) {
+        ESP_LOGW(TAG, "SDP rejected: no audio media port (m=)");
         return ESP_ERR_INVALID_ARG;
     }
-
-    /* Derive word length from codec if not set */
+    if ((int)sdp->codec < 0 || sdp->sample_rate == 0) {
+        ESP_LOGW(TAG, "SDP rejected: no usable rtpmap (L16, L24, L32 or AM824)");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sdp->sample_rate != 44100 && sdp->sample_rate != 48000 && sdp->sample_rate != 96000) {
+        ESP_LOGW(TAG, "SDP rejected: sample rate %lu not supported", (unsigned long)sdp->sample_rate);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sdp->channels < 1 || sdp->channels > CONFIG_AES67_MAX_CHANNELS_PER_STREAM) {
+        ESP_LOGW(TAG, "SDP rejected: %u channels (1..%d supported)",
+                 sdp->channels, CONFIG_AES67_MAX_CHANNELS_PER_STREAM);
+        return ESP_ERR_INVALID_ARG;
+    }
     if (sdp->word_length == 0) {
         sdp->word_length = aes67_codec_word_length(sdp->codec);
     }
+    if (sdp->word_length < 2 || sdp->word_length > 4) {
+        ESP_LOGW(TAG, "SDP rejected: word length %u", sdp->word_length);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sdp->ptime_us == 0 && sdp->framecount == 0) {
+        sdp->ptime_us = 1000;                   /* AES67 default when unstated */
+    }
+    if (sdp->framecount && sdp->ptime_us == 0) {
+        sdp->ptime_us = ((uint64_t)sdp->framecount * 1000000ULL + sdp->sample_rate / 2) / sdp->sample_rate;
+    }
+    if (sdp->ptime_us < 125 || sdp->ptime_us > 4000) {
+        ESP_LOGW(TAG, "SDP rejected: ptime %lu us (125..4000 supported)", (unsigned long)sdp->ptime_us);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sdp->connection_ip == 0) {
+        ESP_LOGW(TAG, "SDP rejected: no connection address (c=)");
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    ESP_LOGD(TAG, "Parsed SDP: %s, %s/%u/%u, port %u, ptime %u us",
+    ESP_LOGD(TAG, "Parsed SDP: %s, %s/%lu/%u, port %u, ptime %lu us",
              sdp->session_name, aes67_codec_to_str(sdp->codec),
-             sdp->sample_rate, sdp->channels, sdp->port, sdp->ptime_us);
+             (unsigned long)sdp->sample_rate, sdp->channels, sdp->port,
+             (unsigned long)sdp->ptime_us);
 
     return ESP_OK;
 }
