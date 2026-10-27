@@ -188,6 +188,8 @@ typedef struct {
     uint16_t ring_buffer_ms;            /* Audio ring buffer size in ms */
     bool use_psram;                     /* Allocate large buffers in PSRAM */
     bool sap_enabled;                   /* Enable SAP announcements */
+    uint16_t sap_interval_s;            /* Own announce interval (0 = 30 s) */
+    uint16_t sap_min_expiry_s;          /* Remote sources live at least this long without an announcement (0 = 60 s) */
     bool mdns_enabled;                  /* Enable mDNS advertisement */
     bool eth_rx_hook;                   /* Take PTP and RTP off the Ethernet input path before lwIP (default) */
 
@@ -231,6 +233,8 @@ typedef struct {
     .ring_buffer_ms = CONFIG_AES67_AUDIO_RING_BUFFER_MS, \
     .use_psram = true, \
     .sap_enabled = true, \
+    .sap_interval_s = 0, \
+    .sap_min_expiry_s = 0, \
     .mdns_enabled = true, \
     .eth_rx_hook = true, \
     .output_mode = AES67_OUTPUT_I2S, \

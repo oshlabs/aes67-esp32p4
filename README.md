@@ -176,6 +176,10 @@ All parameters are configurable via `idf.py menuconfig` under "AES67 RAVENNA Com
   default `"ETH_DEF"` (what `ESP_NETIF_DEFAULT_ETH()` creates). Node init fails
   with a clear error if no netif has that key.
 - Jitter buffer depth (default: 4ms)
+- `config.sap_interval_s` / `config.sap_min_expiry_s`: own SAP announce interval
+  (default 30 s, plus two quick repeats after creation) and the shortest time a
+  discovered source is kept without an announcement (default 60 s; otherwise ten
+  times the interval it announces at, at most an hour)
 - Audio clock recovery on/off and its maximum correction (default: on, 200 ppm)
 - PSRAM usage for buffers
 - I2S pin assignments

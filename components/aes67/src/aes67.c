@@ -470,6 +470,7 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
             ESP_LOGE(TAG, "SAP init failed: %s", esp_err_to_name(ret));
             goto fail_sap;
         }
+        aes67_sap_set_timing(node->sap, node->config.sap_interval_s, node->config.sap_min_expiry_s);
     }
 
     /* 4. Audio I/O driver (I2S + DMA) */

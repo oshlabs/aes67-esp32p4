@@ -32,6 +32,7 @@ typedef struct {
     char name[64];                      /* Session name from SDP */
     char sdp[AES67_SAP_MAX_SDP_LEN];   /* Full SDP text */
     uint32_t last_seen;                 /* Tick count of last announcement */
+    uint32_t interval_ms;               /* Announce interval seen (0 until two arrivals) */
 } aes67_sap_remote_source_t;
 
 /* Callback when a remote source is discovered or lost */
@@ -46,6 +47,15 @@ typedef struct aes67_sap_ctx *aes67_sap_handle_t;
  * Initialize the SAP subsystem.
  */
 esp_err_t aes67_sap_init(aes67_sap_handle_t *handle);
+
+/**
+ * Announce timing. `interval_s` is this node's own announce interval
+ * (default 30 s; a new source is also announced at once and twice more
+ * within the first seconds). A remote source expires after ten times the
+ * interval it is seen announcing at, but never before `min_expiry_s`
+ * (default 60 s) and never later than an hour. Call before start.
+ */
+esp_err_t aes67_sap_set_timing(aes67_sap_handle_t handle, uint16_t interval_s, uint16_t min_expiry_s);
 
 /**
  * Start SAP announcements and listening.

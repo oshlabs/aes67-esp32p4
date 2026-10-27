@@ -33,8 +33,20 @@ static const char *TAG = "aes67_sap";
 #define SAP_CONTENT_TYPE_LEN 16  /* includes null terminator */
 #define SAP_ANNOUNCE_FLAG    0x20
 #define SAP_DELETE_FLAG      0x24
-#define SAP_TX_INTERVAL_MS   2000    /* Announce every 2s for fast discovery */
-#define SAP_TIMEOUT_MS       10000   /* Expire remote sources after 10s silence */
+#define SAP_FLAG_VERSION(f)  ((f) >> 5)
+#define SAP_FLAG_IPV6        0x10
+#define SAP_FLAG_DELETE      0x04
+#define SAP_FLAG_ENCRYPTED   0x02
+#define SAP_FLAG_COMPRESSED  0x01
+/* Announce timing (RFC 2974: a session times out after ten times its
+ * announce interval or an hour, whichever is larger; AES67 and RAVENNA
+ * devices announce about every 30 s). A new source is announced at once
+ * and twice more shortly after so it is found without waiting a period. */
+#define SAP_TX_INTERVAL_S_DEFAULT   30
+#define SAP_MIN_EXPIRY_S_DEFAULT    60
+#define SAP_MAX_EXPIRY_MS           3600000
+#define SAP_BURST_REPEATS           2
+#define SAP_BURST_SPACING_MS        1500
 #define SAP_RX_BUF_SIZE      1500
 #define SAP_MAX_LOCAL         8
 #define SAP_MAX_REMOTE        16
@@ -50,6 +62,8 @@ typedef struct {
     bool active;
     uint16_t msg_id;
     uint32_t origin_ip;
+    uint32_t next_tx_tick;      /* when the TX task sends it next */
+    uint8_t burst_left;         /* quick repeats still to send after creation */
     char sdp[AES67_SAP_MAX_SDP_LEN];
 } sap_local_source_t;
 
@@ -70,6 +84,8 @@ struct aes67_sap_ctx {
 
     aes67_sap_event_cb_t event_cb;
     void *user_data;
+    uint32_t tx_interval_ms;
+    uint32_t min_expiry_ms;
 
     sap_local_source_t local[SAP_MAX_LOCAL];
     int local_count;
@@ -191,27 +207,53 @@ static void extract_session_name(const char *sdp, char *name, size_t name_len)
 static void handle_sap_rx(struct aes67_sap_ctx *ctx, const uint8_t *data,
                           int len)
 {
-    /* Minimum: 8 byte header + content type + some SDP */
-    if (len < SAP_HEADER_SIZE + SAP_CONTENT_TYPE_LEN + 4) {
+    /* Header per RFC 2974: flags, auth length (32-bit words), message id
+     * hash, origin (IPv4 or IPv6), optional authentication data, then an
+     * optional null-terminated payload type; the payload follows. */
+    if (len < SAP_HEADER_SIZE + 4) {
         return;
     }
-
     uint8_t flags = data[0];
+    if (SAP_FLAG_VERSION(flags) != 1) {
+        ESP_LOGD(TAG, "SAP version %u ignored", SAP_FLAG_VERSION(flags));
+        return;
+    }
+    if (flags & (SAP_FLAG_ENCRYPTED | SAP_FLAG_COMPRESSED)) {
+        ESP_LOGD(TAG, "encrypted or compressed SAP payload ignored");
+        return;
+    }
+    uint32_t auth_len = (uint32_t)data[1] * 4;
     uint16_t msg_id = ((uint16_t)data[2] << 8) | data[3];
+    if (flags & SAP_FLAG_IPV6) {
+        ESP_LOGD(TAG, "SAP with IPv6 origin ignored");
+        return;
+    }
     uint32_t origin_ip;
     memcpy(&origin_ip, data + 4, 4); /* Already in network byte order */
 
-    /* Verify content type */
-    if (memcmp(data + SAP_HEADER_SIZE, SAP_CONTENT_TYPE,
-               SAP_CONTENT_TYPE_LEN) != 0) {
-        ESP_LOGD(TAG, "SAP packet with unknown content type, ignoring");
+    uint32_t off = SAP_HEADER_SIZE + auth_len;
+    if (off + 4 > (uint32_t)len) {
         return;
     }
+    const char *payload = (const char *)(data + off);
+    uint32_t avail = (uint32_t)len - off;
+    if (memcmp(payload, "v=0", 3) != 0) {
+        /* A payload type precedes the SDP; only application/sdp is understood */
+        size_t tl = strnlen(payload, avail);
+        if (tl == avail || strcmp(payload, SAP_CONTENT_TYPE) != 0) {
+            ESP_LOGD(TAG, "SAP payload type not application/sdp, ignoring");
+            return;
+        }
+        payload += tl + 1;
+        avail -= tl + 1;
+        if (avail < 4 || memcmp(payload, "v=0", 3) != 0) {
+            return;
+        }
+    }
+    const char *sdp = payload;
+    int sdp_len = (int)avail;
 
-    const char *sdp = (const char *)(data + SAP_HEADER_SIZE + SAP_CONTENT_TYPE_LEN);
-    int sdp_len = len - SAP_HEADER_SIZE - SAP_CONTENT_TYPE_LEN;
-
-    bool is_delete = (flags & 0x04) != 0;
+    bool is_delete = (flags & SAP_FLAG_DELETE) != 0;
 
     /* Event to deliver after the lock is released, if any */
     aes67_sap_remote_source_t *event = ctx->event_copy;
@@ -232,8 +274,14 @@ static void handle_sap_rx(struct aes67_sap_ctx *ctx, const uint8_t *data,
         /* Announce: add or update */
         int idx = find_remote(ctx, origin_ip, msg_id);
         if (idx >= 0) {
-            /* Update existing entry timestamp */
-            ctx->remote[idx].last_seen = xTaskGetTickCount();
+            /* Update existing entry: arrival time and the interval it
+             * announces at (its expiry follows from that) */
+            uint32_t now = xTaskGetTickCount();
+            uint32_t gap_ms = pdTICKS_TO_MS(now - ctx->remote[idx].last_seen);
+            if (gap_ms >= 500) {
+                ctx->remote[idx].interval_ms = gap_ms;
+            }
+            ctx->remote[idx].last_seen = now;
             /* Update SDP in case it changed */
             if (sdp_len < (int)sizeof(ctx->remote[idx].sdp)) {
                 memcpy(ctx->remote[idx].sdp, sdp, sdp_len);
@@ -286,11 +334,26 @@ static void handle_sap_rx(struct aes67_sap_ctx *ctx, const uint8_t *data,
     }
 }
 
-/* Check for timed-out remote sources (not seen within SAP_TIMEOUT_MS) */
+/* Expiry of a remote source: ten announce intervals, at least the
+ * configured minimum, at most an hour */
+static uint32_t remote_expiry_ms(const struct aes67_sap_ctx *ctx,
+                                 const aes67_sap_remote_source_t *src)
+{
+    uint32_t ms = src->interval_ms ? src->interval_ms * 10 : ctx->min_expiry_ms;
+    if (ms < ctx->min_expiry_ms) {
+        ms = ctx->min_expiry_ms;
+    }
+    if (ms > SAP_MAX_EXPIRY_MS) {
+        ms = SAP_MAX_EXPIRY_MS;
+    }
+    return ms;
+}
+
+/* Check for timed-out remote sources */
 static void expire_remote_sources(struct aes67_sap_ctx *ctx)
 {
-    uint32_t timeout_ticks = pdMS_TO_TICKS(SAP_TIMEOUT_MS);
     aes67_sap_remote_source_t *expired = ctx->event_copy;
+    uint32_t expired_after_ms = 0;
 
     /* Remove one expired entry per pass under the lock, deliver the event
      * with the lock released, repeat until none is left. */
@@ -299,8 +362,10 @@ static void expire_remote_sources(struct aes67_sap_ctx *ctx)
         xSemaphoreTake(ctx->lock, portMAX_DELAY);
         uint32_t now = xTaskGetTickCount();
         for (int i = ctx->remote_count - 1; i >= 0; i--) {
-            if (now - ctx->remote[i].last_seen >= timeout_ticks) {
+            uint32_t expiry_ms = remote_expiry_ms(ctx, &ctx->remote[i]);
+            if (pdTICKS_TO_MS(now - ctx->remote[i].last_seen) >= expiry_ms) {
                 *expired = ctx->remote[i];
+                expired_after_ms = expiry_ms;
                 remove_remote(ctx, i);
                 found = true;
                 break;
@@ -310,8 +375,8 @@ static void expire_remote_sources(struct aes67_sap_ctx *ctx)
         if (!found) {
             return;
         }
-        ESP_LOGI(TAG, "Source timeout: \"%s\" (no announcement for %ds)",
-                 expired->name, SAP_TIMEOUT_MS / 1000);
+        ESP_LOGI(TAG, "Source timeout: \"%s\" (no announcement for %lu s)",
+                 expired->name, (unsigned long)(expired_after_ms / 1000));
         if (ctx->event_cb) {
             ctx->event_cb(false, expired, ctx->user_data);
         }
@@ -381,27 +446,29 @@ static void sap_tx_task(void *arg)
     ESP_LOGI(TAG, "SAP TX task started");
 
     while (ctx->running) {
-        /* Announce all active local sources */
+        /* Announce every local source that is due: the quick repeats after
+         * creation first, then once per interval */
+        uint32_t now = xTaskGetTickCount();
         for (int i = 0; i < SAP_MAX_LOCAL; i++) {
             xSemaphoreTake(ctx->lock, portMAX_DELAY);
             int pkt_len = -1;
-            if (ctx->local[i].active) {
+            sap_local_source_t *l = &ctx->local[i];
+            if (l->active && (int32_t)(now - l->next_tx_tick) >= 0) {
                 pkt_len = build_sap_packet(tx_buf, sizeof(tx_buf),
-                                           SAP_ANNOUNCE_FLAG,
-                                           ctx->local[i].msg_id,
-                                           ctx->local[i].origin_ip,
-                                           ctx->local[i].sdp);
+                                           SAP_ANNOUNCE_FLAG, l->msg_id,
+                                           l->origin_ip, l->sdp);
+                if (l->burst_left) {
+                    l->burst_left--;
+                }
+                l->next_tx_tick = now + pdMS_TO_TICKS(l->burst_left ? SAP_BURST_SPACING_MS
+                                                                    : ctx->tx_interval_ms);
             }
             xSemaphoreGive(ctx->lock);
             if (pkt_len > 0) {
                 send_sap_packet(ctx->sock, tx_buf, pkt_len);
             }
         }
-
-        /* Wait for the next announcement interval, checking running flag */
-        for (int i = 0; i < SAP_TX_INTERVAL_MS / 100 && ctx->running; i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     ESP_LOGI(TAG, "SAP TX task stopped");
@@ -425,6 +492,8 @@ esp_err_t aes67_sap_init(aes67_sap_handle_t *handle)
     ctx->user_data = NULL;
     ctx->local_count = 0;
     ctx->remote_count = 0;
+    ctx->tx_interval_ms = SAP_TX_INTERVAL_S_DEFAULT * 1000;
+    ctx->min_expiry_ms = SAP_MIN_EXPIRY_S_DEFAULT * 1000;
     ctx->lock = xSemaphoreCreateMutex();
     ctx->rx_done = xSemaphoreCreateBinary();
     ctx->tx_done = xSemaphoreCreateBinary();
@@ -440,6 +509,14 @@ esp_err_t aes67_sap_init(aes67_sap_handle_t *handle)
 
     *handle = ctx;
     ESP_LOGI(TAG, "SAP subsystem initialized");
+    return ESP_OK;
+}
+
+esp_err_t aes67_sap_set_timing(aes67_sap_handle_t handle, uint16_t interval_s, uint16_t min_expiry_s)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    handle->tx_interval_ms = (interval_s ? interval_s : SAP_TX_INTERVAL_S_DEFAULT) * 1000UL;
+    handle->min_expiry_ms = (min_expiry_s ? min_expiry_s : SAP_MIN_EXPIRY_S_DEFAULT) * 1000UL;
     return ESP_OK;
 }
 
@@ -597,6 +674,12 @@ esp_err_t aes67_sap_announce(aes67_sap_handle_t handle,
     handle->local[slot].active = true;
     handle->local[slot].msg_id = msg_id;
     handle->local[slot].origin_ip = origin_ip;
+    if (!updated) {
+        /* Sent at once below; the TX task repeats it twice quickly, then
+         * once per interval */
+        handle->local[slot].burst_left = SAP_BURST_REPEATS;
+        handle->local[slot].next_tx_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SAP_BURST_SPACING_MS);
+    }
     strncpy(handle->local[slot].sdp, sdp, AES67_SAP_MAX_SDP_LEN - 1);
     handle->local[slot].sdp[AES67_SAP_MAX_SDP_LEN - 1] = '\0';
     if (!updated) {
