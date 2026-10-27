@@ -12,6 +12,7 @@
  */
 
 #include "aes67_audio.h"
+#include "aes67_audio_internal.h"
 #include <string.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"

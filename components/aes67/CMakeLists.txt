@@ -28,6 +28,8 @@ idf_component_register(
         "third_party/ptpd"
         "third_party/ptpd/include"
         "third_party/esp_eth_time"
+    REQUIRES
+        esp_event           # AES67_EVENT base in aes67.h
     PRIV_REQUIRES
         esp_eth
         esp_netif
@@ -38,7 +40,6 @@ idf_component_register(
         esp_psram
         esp_mm
         esp_http_server
-        esp_event
         json
 )
 
@@ -81,6 +82,6 @@ set_source_files_properties(
 # Kconfig; silence that one warning for the bundled file only.
 set_source_files_properties(
     third_party/ptpd/ptpd.c
-    PROPERTIES COMPILE_OPTIONS "-Wno-unused-function;-Wno-missing-prototypes"
+    PROPERTIES COMPILE_OPTIONS "-Wno-missing-prototypes"
 )
 

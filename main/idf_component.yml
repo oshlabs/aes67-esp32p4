@@ -1,7 +1,5 @@
 dependencies:
   idf:
-    version: ">=5.5.0"
-  espressif/esp-dsp:
-    version: "*"
+    version: ">=5.5.2"
   espressif/es8311:
-    version: "*"
+    version: "^1.0.0"

@@ -23,6 +23,7 @@
 #include "aes67_eth_rx.h"
 #include "aes67_clock.h"
 #include "aes67_mdns.h"
+#include "aes67_audio_internal.h"
 
 #include <stdlib.h>
 #include <string.h>

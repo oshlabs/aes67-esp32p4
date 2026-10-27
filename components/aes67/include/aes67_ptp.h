@@ -16,8 +16,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
-#include "esp_eth.h"
-#include "aes67_config.h"
+#include "aes67_config.h"      /* esp_eth_handle_t */
 
 #ifdef __cplusplus
 extern "C" {

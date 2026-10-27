@@ -20,7 +20,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
-#include "driver/i2s_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,12 +68,6 @@ esp_err_t aes67_audio_get_config(aes67_audio_handle_t handle,
                                  aes67_audio_config_t *config);
 
 
-
-/**
- * Get the I2S TX channel handle (the playback task writes to it in
- * callback and stream-buffer output modes).
- */
-i2s_chan_handle_t aes67_audio_get_tx_chan(aes67_audio_handle_t handle);
 
 
 

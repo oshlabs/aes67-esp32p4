@@ -45,7 +45,6 @@
 #include "aes67_sap.h"
 #include "aes67_ptp.h"
 #include "aes67_audio.h"
-#include "dsps_tone_gen.h"
 #include "driver/i2c.h"
 #include "esp_ldo_regulator.h"
 #include "es8311.h"
