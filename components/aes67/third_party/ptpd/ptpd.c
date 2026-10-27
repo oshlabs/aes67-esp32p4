@@ -339,6 +339,18 @@ typedef struct
 
 static QueueHandle_t s_hook_queue = NULL;
 
+/* Runtime configuration (ESP port): the PTP domain and whether the daemon
+ * may act as master when no better clock is on the network. Set before
+ * ptpd_start(); the Kconfig values are the defaults. */
+static uint8_t s_ptpd_domain = CONFIG_NETUTILS_PTPD_DOMAIN;
+static bool s_ptpd_allow_server = true;
+
+void ptpd_configure(uint8_t domain, bool allow_server)
+{
+  s_ptpd_domain = domain;
+  s_ptpd_allow_server = allow_server;
+}
+
 int ptpd_hook_input(const uint8_t *frame, size_t len, const void *mac_ts)
 {
   QueueHandle_t q = s_hook_queue;
@@ -842,7 +854,7 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->offset_pi.drift_acc = 0;
 
   state->own_identity.header.version = 2;
-  state->own_identity.header.domain = CONFIG_NETUTILS_PTPD_DOMAIN;
+  state->own_identity.header.domain = s_ptpd_domain;
   state->own_identity.header.sourceidentity[0] = state->intf_hw_addr[0];
   state->own_identity.header.sourceidentity[1] = state->intf_hw_addr[1];
   state->own_identity.header.sourceidentity[2] = state->intf_hw_addr[2];
@@ -1025,7 +1037,7 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
     }
 
   state->own_identity.header.version = 2;
-  state->own_identity.header.domain = CONFIG_NETUTILS_PTPD_DOMAIN;
+  state->own_identity.header.domain = s_ptpd_domain;
   state->own_identity.header.sourceidentity[0] = req.ifr_hwaddr.sa_data[0];
   state->own_identity.header.sourceidentity[1] = req.ifr_hwaddr.sa_data[1];
   state->own_identity.header.sourceidentity[2] = req.ifr_hwaddr.sa_data[2];
@@ -1472,7 +1484,7 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state)
    * act as the reference source and send server packets.
    */
 
-  if (!state->selected_source_valid)
+  if (!state->selected_source_valid && s_ptpd_allow_server)
     {
       struct timespec time_now;
       struct timespec delta;
@@ -2111,7 +2123,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
       return OK;
     }
 
-  if (state->rxbuf.header.domain != CONFIG_NETUTILS_PTPD_DOMAIN)
+  if (state->rxbuf.header.domain != s_ptpd_domain)
     {
       /* Part of different clock domain, ignore */
 

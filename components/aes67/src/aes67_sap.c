@@ -54,8 +54,8 @@ static const char *TAG = "aes67_sap";
 #define SAP_SELECT_TIMEOUT_S  1       /* bounds the stop latency and the expiry scan */
 #define SAP_RX_TASK_STACK     12288  /* Needs room for callback -> add_source -> SDP log */
 #define SAP_TX_TASK_STACK     4096
-#define SAP_RX_TASK_PRIO      5   /* Background - discovery */
-#define SAP_TX_TASK_PRIO      4   /* Background - periodic announce */
+#define SAP_RX_TASK_PRIO      CONFIG_AES67_TASK_PRIORITY_SAP          /* discovery */
+#define SAP_TX_TASK_PRIO      (CONFIG_AES67_TASK_PRIORITY_SAP > 1 ? CONFIG_AES67_TASK_PRIORITY_SAP - 1 : 1)
 
 /* Locally announced source */
 typedef struct {

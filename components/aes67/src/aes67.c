@@ -639,7 +639,7 @@ esp_err_t aes67_node_start(aes67_node_handle_t handle)
      * bypassing the playback task entirely (zero scheduling overhead). */
     if (handle->config.output_mode != AES67_OUTPUT_I2S) {
         xTaskCreatePinnedToCore(playback_task, "aes67_pb", 8192, handle,
-                                21, &handle->pb_task, 0);
+                                CONFIG_AES67_TASK_PRIORITY_AUDIO, &handle->pb_task, 0);
         aes67_rtp_engine_set_notify_task(handle->rtp, handle->pb_task);
         ESP_LOGI(TAG, "Playback task started (output_mode=%d)", handle->config.output_mode);
     } else {
@@ -652,7 +652,7 @@ esp_err_t aes67_node_start(aes67_node_handle_t handle)
     if (ret == ESP_OK) {
         BaseType_t xret = xTaskCreatePinnedToCore(
             audio_frame_task, "aes67_tic", 8192, handle,
-            21,     /* High priority, just below audio I/O (22) */
+            CONFIG_AES67_TASK_PRIORITY_AUDIO,
             &handle->tx_task,
             0       /* Pin to core 0 (PTP/network core) */
         );

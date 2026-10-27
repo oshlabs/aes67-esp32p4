@@ -550,8 +550,7 @@ esp_err_t aes67_audio_init(const aes67_audio_config_t *audio_config,
     }
 
     /* --- Configure I2S channels --- */
-    /* Official ESP-IDF es8311 example for ESP32-P4 uses I2S_NUM_0 */
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG((i2s_port_t)CONFIG_AES67_I2S_PORT, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = DMA_DESC_NUM;
     chan_cfg.dma_frame_num = DMA_FRAME_NUM;
     /* When using ISR callback, auto_clear doesn't matter because the ISR

@@ -45,7 +45,7 @@ static const char *TAG = "aes67_ptp";
 #define PTP_GM_GRACE_MS             (3 * CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MSEC)
 #define PTP_MONITOR_INTERVAL_MS     500
 #define PTP_MONITOR_STACK_SIZE      4096
-#define PTP_MONITOR_PRIORITY        10  /* Above SAP, below RTP/audio */
+#define PTP_MONITOR_PRIORITY        CONFIG_AES67_TASK_PRIORITY_PTP
 #define PTP_STATUS_FAILS_BEFORE_UNLOCK 4   /* consecutive ptpd_status failures */
 
 /* PTP daemon and clock APIs from local components */
@@ -387,6 +387,7 @@ esp_err_t aes67_ptp_start(aes67_ptp_handle_t handle)
 
     /* Start the ptpd daemon on the configured netif key; the call returns
      * only after the daemon has opened its tap and sockets, or failed. */
+    ptpd_configure(handle->config.domain, handle->config.prefer_grandmaster);
     int pid = ptpd_start(handle->netif_key);
     if (pid < 0) {
         ESP_LOGE(TAG, "ptpd_start on \"%s\" failed (%d)", handle->netif_key, pid);

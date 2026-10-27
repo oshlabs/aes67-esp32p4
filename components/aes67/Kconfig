@@ -116,32 +116,38 @@ menu "AES67 RAVENNA Component"
             sits between I2S and the RTP engine.
 
     config AES67_TASK_PRIORITY_PTP
-        int "PTP task priority"
-        default 20
+        int "PTP monitor task priority"
+        default 10
         range 1 25
         help
-            FreeRTOS priority for the PTP synchronization task.
+            FreeRTOS priority of the task that polls the PTP daemon's status
+            and drives the lock state. The daemon itself runs at
+            CONFIG_NETUTILS_PTPD_SERVERPRIO.
 
     config AES67_TASK_PRIORITY_RTP
-        int "RTP task priority"
-        default 19
+        int "RTP socket receive task priority"
+        default 17
         range 1 25
         help
-            FreeRTOS priority for the RTP packet processing task.
+            FreeRTOS priority of the socket receive task (used when the
+            Ethernet receive hook is off). Keep it below lwIP's.
 
     config AES67_TASK_PRIORITY_AUDIO
         int "Audio frame task priority"
-        default 22
+        default 21
         range 1 25
         help
-            FreeRTOS priority for the audio frame (TIC) processing task.
+            FreeRTOS priority of the frame task (TIC) and of the playback task
+            in callback/stream-buffer output modes. Just below the I2S/EMAC
+            interrupt-driven work.
 
     config AES67_TASK_PRIORITY_SAP
         int "SAP task priority"
         default 5
-        range 1 25
+        range 2 25
         help
-            FreeRTOS priority for SAP announcement task.
+            FreeRTOS priority of the SAP receive task; the announce task runs
+            one below.
 
     config AES67_NODE_NAME
         string "Default node name"

@@ -163,28 +163,37 @@ components/aes67/
 
 ## Configuration
 
-All parameters are configurable via `idf.py menuconfig` under "AES67 RAVENNA Component":
+All parameters are configurable via `idf.py menuconfig` under "AES67 RAVENNA Component".
+Every option listed there is read by the code; this is what each one does:
 
-- Max sources/sinks (default: 4 each)
-- Max channels per stream (default: 8)
-- Sample rate (default: 48000 Hz)
-- Packet time (default: 1000us)
-- Word length / codec (default: 3 = L24)
-- Default channel count (default: 2)
-- RTP port (default: 5004)
-- PTP domain (default: 0)
+| Option | Effect |
+|---|---|
+| `AES67_MAX_SOURCES`, `AES67_MAX_SINKS`, `AES67_MAX_CHANNELS_PER_STREAM` | Table sizes; the channel limit also sizes the engine's scratch buffers |
+| `AES67_DEFAULT_SAMPLE_RATE`, `_PACKET_TIME_US`, `_WORD_LENGTH`, `_CHANNELS` | `AES67_CONFIG_DEFAULT()` audio settings; the packet time is also the frame task's tick |
+| `AES67_RTP_PORT`, `AES67_RTP_MCAST_BASE` | Default RTP port and the first multicast group for local sources |
+| `AES67_SAP_ENABLED`, `AES67_MDNS_ENABLED` | Defaults for `config.sap_enabled` / `config.mdns_enabled` |
+| `AES67_PTP_DOMAIN`, `AES67_PTP_PREFER_GRANDMASTER` | Defaults for `config.ptp`; passed to the PTP daemon at start (domain, permission to act as master) |
+| `AES67_JITTER_BUFFER_MS`, `AES67_AUDIO_RING_BUFFER_MS`, `AES67_USE_PSRAM` | Sink playout delay, audio buffer sizing, PSRAM for large buffers |
+| `AES67_TASK_PRIORITY_PTP`, `_RTP`, `_AUDIO`, `_SAP` | FreeRTOS priorities of the PTP monitor, the socket receive task, the frame/playback tasks and the SAP tasks |
+| `AES67_NODE_NAME`, `AES67_I2S_PORT`, `AES67_I2S_*_GPIO` | Node name for SDP/mDNS, I2S peripheral and pins |
+| `AES67_PTP_LOCK_THRESHOLD_NS` | Filtered offset below which the node reports PTP "locked" |
+| `AES67_CLOCK_RECOVERY`, `AES67_CLOCK_MAX_CORRECTION_PPM` | Audio clock steering to PTP and its clamp |
+| `AES67_WEBUI_ENABLED`, `AES67_WEBUI_PORT`, `AES67_WEBUI_TOKEN`, `AES67_WEBUI_PUSH_INTERVAL_MS` | Web UI on/off (in the example), its port, control token and status push rate |
+
+Runtime fields of `aes67_config_t` beyond those:
+
+- `config.net.eth_handle`: the Ethernet driver handle (required).
 - `config.net.interface_name`: the esp_netif key of your Ethernet interface,
   default `"ETH_DEF"` (what `ESP_NETIF_DEFAULT_ETH()` creates). Node init fails
   with a clear error if no netif has that key.
-- Jitter buffer depth (default: 4ms)
 - `config.sap_interval_s` / `config.sap_min_expiry_s`: own SAP announce interval
   (default 30 s, plus two quick repeats after creation) and the shortest time a
   discovered source is kept without an announcement (default 60 s; otherwise ten
-  times the interval it announces at, at most an hour)
-- Audio clock recovery on/off and its maximum correction (default: on, 200 ppm)
-- PSRAM usage for buffers
-- I2S pin assignments
-- Task priorities
+  times the interval it announces at, at most an hour).
+- `config.eth_rx_hook`: take PTP and RTP off the Ethernet input path before lwIP
+  (default on; off uses sockets, with higher latency and software PTP timestamps).
+- `config.output_mode`, `config.audio_cb`: where received audio goes (I2S, a
+  callback, or a stream buffer the application reads).
 
 ## Security model
 

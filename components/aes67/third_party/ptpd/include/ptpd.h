@@ -202,6 +202,11 @@ int ptpd_stop(int pid);
 
 int ptpd_hook_input(const uint8_t *frame, size_t len, const void *mac_ts);
 
+/* ESP port: set the PTP domain and whether the daemon may become master
+ * (when no better clock announces) before ptpd_start(). Defaults are the
+ * Kconfig values and "allowed". */
+void ptpd_configure(uint8_t domain, bool allow_server);
+
 #undef EXTERN
 #ifdef __cplusplus
 }

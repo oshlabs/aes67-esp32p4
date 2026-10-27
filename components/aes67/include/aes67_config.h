@@ -34,8 +34,22 @@ extern "C" {
 #define AES67_VERSION_STRING "0.0.0"
 #endif
 
+/* Kconfig booleans are absent when off; use them as 0/1 */
+#ifndef CONFIG_AES67_USE_PSRAM
+#define CONFIG_AES67_USE_PSRAM 0
+#endif
+#ifndef CONFIG_AES67_SAP_ENABLED
+#define CONFIG_AES67_SAP_ENABLED 0
+#endif
+#ifndef CONFIG_AES67_MDNS_ENABLED
+#define CONFIG_AES67_MDNS_ENABLED 0
+#endif
+#ifndef CONFIG_AES67_PTP_PREFER_GRANDMASTER
+#define CONFIG_AES67_PTP_PREFER_GRANDMASTER 0
+#endif
+
 /* ---- Limits ---- */
-#define AES67_MAX_CHANNELS_PER_STREAM  8
+#define AES67_MAX_CHANNELS_PER_STREAM  CONFIG_AES67_MAX_CHANNELS_PER_STREAM
 #define AES67_MAX_TIC_FRAMES           1024
 #define AES67_MIN_TIC_FRAMES           48
 #define AES67_RTP_HEADER_SIZE          12
@@ -218,7 +232,7 @@ typedef struct {
     .ptp = { \
         .domain = CONFIG_AES67_PTP_DOMAIN, \
         .dscp = 46, \
-        .prefer_grandmaster = true, \
+        .prefer_grandmaster = CONFIG_AES67_PTP_PREFER_GRANDMASTER, \
     }, \
     .audio = { \
         .sample_rate = CONFIG_AES67_DEFAULT_SAMPLE_RATE, \
@@ -236,11 +250,11 @@ typedef struct {
     }, \
     .jitter_buffer_ms = CONFIG_AES67_JITTER_BUFFER_MS, \
     .ring_buffer_ms = CONFIG_AES67_AUDIO_RING_BUFFER_MS, \
-    .use_psram = true, \
-    .sap_enabled = true, \
+    .use_psram = CONFIG_AES67_USE_PSRAM, \
+    .sap_enabled = CONFIG_AES67_SAP_ENABLED, \
     .sap_interval_s = 0, \
     .sap_min_expiry_s = 0, \
-    .mdns_enabled = true, \
+    .mdns_enabled = CONFIG_AES67_MDNS_ENABLED, \
     .eth_rx_hook = true, \
     .output_mode = AES67_OUTPUT_I2S, \
     .audio_cb = NULL, \

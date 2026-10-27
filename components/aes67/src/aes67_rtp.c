@@ -893,7 +893,7 @@ esp_err_t aes67_rtp_engine_start(aes67_rtp_engine_handle_t handle)
         "aes67_rx",
         AES67_RX_TASK_STACK,
         engine,
-        17,  /* Below lwIP (23) */
+        CONFIG_AES67_TASK_PRIORITY_RTP,     /* below lwIP, which delivers to the socket */
         &engine->rx_task,
         0   /* Core 0: all audio/network on same core for cache coherency */
     );

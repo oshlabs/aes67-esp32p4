@@ -33,3 +33,7 @@ re-synced against a newer upstream:
   Sync/follow-up are sent per transport with each transport's own stamp.
   `IP_MULTICAST_LOOP` is off on the transmit socket. The daemon task runs at
   `CONFIG_NETUTILS_PTPD_SERVERPRIO` instead of idle+2.
+- `ptpd_configure(domain, allow_server)`: the domain and the permission to act
+  as master are runtime settings (from `aes67_ptp_config_t`), with the
+  Kconfig values as defaults; the three `CONFIG_NETUTILS_PTPD_DOMAIN` uses and
+  the server branch of `ptp_periodic_send()` read them.

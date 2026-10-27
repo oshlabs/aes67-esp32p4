@@ -561,12 +561,14 @@ void app_main(void)
     }
 #endif
 
-    /* Start the WebUI (HTTP + WebSocket) on port 80 */
+#if CONFIG_AES67_WEBUI_ENABLED
+    /* Start the WebUI (HTTP + WebSocket) */
     aes67_webui_handle_t webui = NULL;
-    if (aes67_webui_init(node, 80, &webui) == ESP_OK) {
+    if (aes67_webui_init(node, CONFIG_AES67_WEBUI_PORT, &webui) == ESP_OK) {
         register_codec_controls(webui);
         aes67_webui_start(webui);
     }
+#endif
 
     ESP_LOGI(TAG, "node ready");
 
