@@ -27,10 +27,13 @@ The component is the AES67 **engine** plus the drivers it needs:
 - **RTP engine** — source (TX) and sink (RX), L16 / L24 / L32 / AM824
   codecs via a function-pointer conversion dispatch, 1–8 channels, 44.1 and
   48 kHz, packet times from 0.125 ms to 4 ms.
-- **An `esp_vfs_l2tap` receive path** that reads RTP frames at L2 and
-  bypasses the lwIP socket layer for low-latency reception.
-- **ISR-driven I2S playback** on an APLL-derived clock, with sub-ppm clock
-  adjustment for media-clock recovery and sample-hold on underrun.
+- **An Ethernet receive hook** installed on the driver's input path: RTP
+  for active sinks and PTP over UDP are taken off before lwIP, matched per
+  sink on group, port and payload type; everything else goes to lwIP.
+  Optional (`config.eth_rx_hook`); without it a socket receive path is used.
+- **ISR-driven I2S playback** on an APLL-derived clock, with the APLL
+  steered to PTP (a PI loop on the DAC's frame count against PTP time) and
+  sample-hold on underrun.
 - **SAP (RFC 2974)** announce/discover, **SDP** generate/parse
   (AES67-compliant: `a=ts-refclk`, `a=mediaclk`, fractional ptime),
   **mDNS** `_ravenna._udp` advertisement.
@@ -40,12 +43,10 @@ The component is the AES67 **engine** plus the drivers it needs:
 ### What lives in the example, not the component
 
 The repository's [`main/`](https://github.com/DatanoiseTV/aes67-esp32p4/tree/main/main)
-example shows the board bring-up (Ethernet/PHY, ES8311 codec) and one extra
-integration: an **`esp_eth` Rx hook** that intercepts RTP frames in the
-driver callback — before lwIP — for the absolute lowest latency (the ~0.7 ms
-figure). That hook is example code you copy and adapt to your board, not a
-component API. The component's own `esp_vfs_l2tap` path is the portable
-low-latency option.
+example shows the board bring-up (Ethernet/PHY, ES8311 codec, the netif),
+auto-subscribing to discovered sources, runtime codec controls on the web
+UI, and a boot-time microphone source. Everything in the audio path is in
+the component.
 
 ## Quick start
 
@@ -58,7 +59,9 @@ idf.py add-dependency "datanoisetv/aes67^2.6.0"
 #include "aes67_session.h"
 
 aes67_config_t cfg = AES67_CONFIG_DEFAULT();
-cfg.net.eth_handle = my_eth_handle;     /* you install esp_eth yourself */
+cfg.net.eth_handle = my_eth_handle;     /* you install esp_eth yourself ... */
+/* ... attached to an esp_netif with the key cfg.net.interface_name
+ * ("ETH_DEF" unless you set it) */
 
 aes67_node_handle_t node;
 aes67_node_init(&cfg, &node);
@@ -68,7 +71,7 @@ aes67_session_handle_t session;
 aes67_node_get_session(node, &session);
 
 uint8_t id;
-aes67_session_add_source(session, "My Source", 2, AES67_CODEC_L24, &id);
+aes67_session_add_source(session, "My Source", 2, AES67_CODEC_L24, 0 /* default ptime */, &id);
 /* add a sink from a discovered SDP: */
 aes67_session_add_sink(session, "My Sink", remote_sdp_text, &id);
 ```
@@ -89,10 +92,12 @@ network tasks to core 0 — see the repository for the full set.
 
 ## Requirements & limitations
 
-- **ESP-IDF v5.5+**, target **esp32p4**.
-- Sample rates **44.1 / 48 kHz** (no 96 kHz yet).
-- The lowest-latency `esp_eth` Rx hook is example wiring, not a component
-  API (see above).
+- **ESP-IDF v5.5.2+**, target **esp32p4** (silicon v3.x needs a build with
+  revision v3.0 as the minimum, see the repository README).
+- Sample rate **48 kHz** is the tested rate; 44.1 kHz works at frame counts
+  that divide evenly, 96 kHz is not implemented.
+- Output is two I2S slots (a stereo codec); TDM output is planned.
+- One node per device.
 - The bundled Web UI is optional and can be left out.
 
 ## Bundled third-party code

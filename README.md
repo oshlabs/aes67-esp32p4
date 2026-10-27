@@ -30,6 +30,31 @@ An ESP-IDF component implementing the AES67 (and RAVENNA-compatible) audio-over-
 | DMA ring (2 x 16 frames) | 0.33ms |
 | **Total** | **~0.72ms** |
 
+## Status
+
+What the code does today, as opposed to what is planned. "Partial" items
+say what is missing.
+
+| Area | State | Note |
+|---|---|---|
+| PTP timeReceiver, hardware timestamps on receive (L2 and UDP) and on transmit | implemented | lock reported from the filtered offset; GPS grandmaster: sub-microsecond |
+| PTP grandmaster when no better clock is present | implemented | `config.ptp.prefer_grandmaster` |
+| RTP sources (TX) at 0.125 to 4 ms, L16/L24/L32, 1 to 8 channels on the wire | implemented | capture is the codec's two slots; wider sources carry silence in channels 2+ |
+| RTP sinks (RX) at 0.125 to 4 ms, L16/L24/L32, up to 8 channels | implemented | output is two I2S slots chosen by `routing[]`; TDM output is planned (no multichannel DAC yet) |
+| AM824 | partial | conversion functions exist, untested against a device |
+| Transmit timing on the media clock's frame grid, timestamps anchored to PTP | implemented | |
+| Audio clock recovery (APLL steered to PTP) | implemented | see below |
+| Playout alignment of a sink to RTP timestamp plus link offset | planned | playout starts at whatever level the first packets left; the level then stays constant |
+| SAP announce/discover per RFC 2974 | implemented | 30 s interval, expiry from the observed interval |
+| SDP generate/parse (ts-refclk with the real grandmaster, framecount, mediaclk) | implemented | host-tested, see `test/` |
+| mDNS `_ravenna._udp` | implemented | no RTSP server, so no `_rtsp._tcp`; RAVENNA controllers that need RTSP DESCRIBE cannot fetch SDPs |
+| Output modes: I2S, callback, stream buffer | implemented | callback and stream buffer go through the playback task |
+| Events on the default event loop (PTP lock, sources/sinks added/removed, sink receiving/timeout) | implemented | remote found/lost events are not posted; use the SAP callback |
+| Web UI and REST API | implemented | token optional, see "Security model" |
+| Sample rates 44.1 kHz | partial | 1 ms at 44.1 kHz is not an integer frame count; 48 kHz is the tested rate |
+| 96 kHz | not implemented | |
+| Several nodes per device | not implemented | the audio driver, frame timer, Ethernet hook and clock loop are single instance |
+
 ## Features
 
 - **PTP (IEEE 1588v2)** clock synchronization using ESP32-P4 EMAC hardware timestamping,
@@ -226,7 +251,9 @@ Put the device behind a firewall if any of that matters in your deployment.
 #include "aes67.h"
 #include "aes67_session.h"
 
-/* Configure and start */
+/* Configure and start. The Ethernet driver must be installed and attached
+ * to an esp_netif whose key is cfg.net.interface_name ("ETH_DEF", what
+ * ESP_NETIF_DEFAULT_ETH() creates); set interface_name if yours differs. */
 aes67_config_t cfg = AES67_CONFIG_DEFAULT();
 cfg.net.eth_handle = my_eth_handle;
 
