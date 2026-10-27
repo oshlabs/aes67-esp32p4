@@ -18,6 +18,7 @@
 #include <time.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_err.h"
 #include "esp_check.h"
 #include "esp_eth.h"
@@ -515,6 +516,20 @@ esp_err_t aes67_ptp_get_status(aes67_ptp_handle_t handle, aes67_ptp_status_t *st
     return ESP_OK;
 }
 
+/* The frame task reads the clock every tick; a failing read is reported
+ * once per ten seconds, not once per tick */
+static void time_read_failed(int ret)
+{
+    static int64_t s_last_us;
+    static uint32_t s_count;
+    s_count++;
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_us > 10000000LL) {
+        s_last_us = now;
+        ESP_LOGE(TAG, "esp_eth_clock_gettime failed (%d), %lu times", ret, (unsigned long)s_count);
+    }
+}
+
 esp_err_t aes67_ptp_get_time_ns(aes67_ptp_handle_t handle, uint64_t *time_ns)
 {
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "handle is NULL");
@@ -523,7 +538,7 @@ esp_err_t aes67_ptp_get_time_ns(aes67_ptp_handle_t handle, uint64_t *time_ns)
     struct timespec ts;
     int ret = esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &ts);
     if (ret != 0) {
-        ESP_LOGE(TAG, "esp_eth_clock_gettime failed (%d)", ret);
+        time_read_failed(ret);
         return ESP_FAIL;
     }
 
@@ -539,7 +554,7 @@ esp_err_t aes67_ptp_get_time(aes67_ptp_handle_t handle, uint32_t *sec, uint32_t 
     struct timespec ts;
     int ret = esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &ts);
     if (ret != 0) {
-        ESP_LOGE(TAG, "esp_eth_clock_gettime failed (%d)", ret);
+        time_read_failed(ret);
         return ESP_FAIL;
     }
 
