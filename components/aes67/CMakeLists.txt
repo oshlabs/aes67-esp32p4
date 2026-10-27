@@ -42,6 +42,19 @@ idf_component_register(
         json
 )
 
+# One source of truth for the version: the component manifest. The macros
+# AES67_VERSION_MAJOR/MINOR/PATCH and AES67_VERSION_STRING come from here.
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/idf_component.yml" AES67_VERSION_LINE REGEX "^version:")
+string(REGEX REPLACE "version: *\"?([0-9]+)\\.([0-9]+)\\.([0-9]+).*" "\\1;\\2;\\3" AES67_VERSION_PARTS "${AES67_VERSION_LINE}")
+list(GET AES67_VERSION_PARTS 0 AES67_VERSION_MAJOR)
+list(GET AES67_VERSION_PARTS 1 AES67_VERSION_MINOR)
+list(GET AES67_VERSION_PARTS 2 AES67_VERSION_PATCH)
+target_compile_definitions(${COMPONENT_LIB} PUBLIC
+    AES67_VERSION_MAJOR=${AES67_VERSION_MAJOR}
+    AES67_VERSION_MINOR=${AES67_VERSION_MINOR}
+    AES67_VERSION_PATCH=${AES67_VERSION_PATCH}
+    AES67_VERSION_STRING="${AES67_VERSION_MAJOR}.${AES67_VERSION_MINOR}.${AES67_VERSION_PATCH}")
+
 # The web page is embedded gzipped. Generate the archive in the build
 # directory from web/index.html, so it is never stale and never tracked.
 set(AES67_WEB_GZ "${CMAKE_CURRENT_BINARY_DIR}/index.html.gz")

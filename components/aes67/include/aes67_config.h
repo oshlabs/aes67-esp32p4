@@ -25,9 +25,14 @@ extern "C" {
 #endif
 
 /* ---- Version ---- */
-#define AES67_VERSION_MAJOR  2
-#define AES67_VERSION_MINOR  2
+/* AES67_VERSION_MAJOR/MINOR/PATCH and AES67_VERSION_STRING are defined by
+ * the component's CMakeLists.txt from the version in idf_component.yml. */
+#ifndef AES67_VERSION_STRING
+#define AES67_VERSION_MAJOR  0
+#define AES67_VERSION_MINOR  0
 #define AES67_VERSION_PATCH  0
+#define AES67_VERSION_STRING "0.0.0"
+#endif
 
 /* ---- Limits ---- */
 #define AES67_MAX_CHANNELS_PER_STREAM  8
