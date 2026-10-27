@@ -84,6 +84,18 @@ int esp_eth_clock_gettime(clockid_t clock_id, struct timespec *tp)
                 errno = esp_eth_clock_esp_err_to_errno(ret);
                 return -1;
             }
+            /* The MAC reads seconds and then sub-seconds as two registers.
+             * When the second rolls over in between, the result is the old
+             * second with the new, tiny nanoseconds: one second early.
+             * Such a torn read always has nanoseconds close to zero, so in
+             * that window read once more; the rollover is behind us then. */
+            if (ptp_time.nanoseconds < 1000000) {
+                ret = esp_eth_ioctl(s_eth_hndl, ETH_MAC_ESP_CMD_G_PTP_TIME, &ptp_time);
+                if (ret != ESP_OK) {
+                    errno = esp_eth_clock_esp_err_to_errno(ret);
+                    return -1;
+                }
+            }
             tp->tv_sec = ptp_time.seconds;
             tp->tv_nsec = ptp_time.nanoseconds;
         } else {
