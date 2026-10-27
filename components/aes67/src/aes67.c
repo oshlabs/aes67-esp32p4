@@ -21,7 +21,7 @@
 #include "aes67_hw_timer.h"
 #include "aes67_net.h"
 #include "aes67_eth_rx.h"
-#include "aes67_audio.h"
+#include "aes67_clock.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -472,6 +472,15 @@ esp_err_t aes67_node_init(const aes67_config_t *config, aes67_node_handle_t *han
     /* 6. PTP lock transitions reach the application through the event loop */
     aes67_ptp_register_lock_cb(node->ptp, node_ptp_lock_cb, node);
 
+#if CONFIG_AES67_CLOCK_RECOVERY
+    /* Audio clock recovery: the APLL follows PTP once both are up */
+    ret = aes67_clock_init(node->audio, node->ptp, node->config.audio.sample_rate);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "clock recovery unavailable: %s (audio clock free-running)",
+                 esp_err_to_name(ret));
+    }
+#endif
+
     /* 7. Initialize hardware PTP frame timer for RTP TX.
      * frame_period = samples_per_packet / sample_rate in nanoseconds */
     uint32_t samples_per_pkt = (node->config.audio.sample_rate *
@@ -567,6 +576,10 @@ esp_err_t aes67_node_start(aes67_node_handle_t handle)
         aes67_rtp_engine_stop(handle->rtp);
         aes67_ptp_stop(handle->ptp);
         return ret;
+    }
+
+    if (aes67_clock_start() == ESP_OK) {
+        ESP_LOGI(TAG, "audio clock steered to PTP");
     }
 
     /* mDNS advertisement (optional) */
@@ -671,6 +684,7 @@ esp_err_t aes67_node_stop(aes67_node_handle_t handle)
         aes67_mdns_deinit();
     }
 
+    aes67_clock_stop();
     aes67_audio_stop(handle->audio);
 
     if (handle->config.sap_enabled && handle->sap) {
@@ -698,6 +712,7 @@ esp_err_t aes67_node_destroy(aes67_node_handle_t handle)
 
     /* Destroy subsystems in reverse init order */
     aes67_session_destroy(handle->session);
+    aes67_clock_deinit();
     aes67_audio_destroy(handle->audio);
 
     if (handle->config.sap_enabled && handle->sap) {
@@ -781,6 +796,14 @@ esp_err_t aes67_node_get_rtp(aes67_node_handle_t handle,
 
     *rtp = handle->rtp;
     return ESP_OK;
+}
+
+esp_err_t aes67_node_get_clock_status(aes67_node_handle_t handle, aes67_clock_status_t *status)
+{
+    if (!handle || !status) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return aes67_clock_get_status(status);
 }
 
 esp_err_t aes67_node_get_rx_stats(aes67_node_handle_t handle, aes67_node_rx_stats_t *stats)

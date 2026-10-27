@@ -147,10 +147,28 @@ void aes67_audio_log_isr_stats(void);
 StreamBufferHandle_t aes67_audio_get_capture_buf(aes67_audio_handle_t handle);
 
 /**
- * Adjust the I2S TX MCLK divider for adaptive clock recovery.
- * ppm_adj: parts-per-million adjustment. +100 = 0.01% faster.
+ * Reference clock the TX DMA ISR stamps its playout snapshots with
+ * (nanoseconds; must be callable from an ISR). Set by the clock-recovery
+ * loop before the audio is started; NULL disables the snapshots.
  */
-void aes67_audio_adjust_clock_ppm(aes67_audio_handle_t handle, int32_t ppm_adj);
+typedef uint64_t (*aes67_audio_clock_fn_t)(void);
+void aes67_audio_set_clock_source(aes67_audio_handle_t handle, aes67_audio_clock_fn_t now_ns);
+
+/**
+ * Latest playout snapshot: frames the DAC has clocked out since init and
+ * the reference time when the TX DMA ISR recorded that count.
+ * ESP_ERR_NOT_FOUND until the first DMA descriptor has completed.
+ */
+esp_err_t aes67_audio_get_playout_snapshot(aes67_audio_handle_t handle,
+                                           uint64_t *frames_out, uint64_t *time_ns);
+
+/** TX DMA ISR totals since init (never reset) */
+typedef struct {
+    uint32_t isr_fires;             /* descriptors played */
+    uint32_t isr_missed;            /* descriptors played without a timely interrupt (stale data) */
+    uint32_t dropouts;              /* times the playout buffer ran dry while a stream was playing */
+} aes67_audio_dma_stats_t;
+esp_err_t aes67_audio_get_dma_stats(aes67_audio_handle_t handle, aes67_audio_dma_stats_t *stats);
 
 #ifdef __cplusplus
 }

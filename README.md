@@ -73,7 +73,7 @@ An ESP-IDF component implementing the AES67 (and RAVENNA-compatible) audio-over-
 - **I2S audio** driver with APLL clock
   - Standard I2S Philips mode, 32-bit slots
   - APLL for exact 48kHz (18.432MHz MCLK)
-  - Adaptive clock recovery via APLL SDM registers
+  - Clock recovery: the APLL is steered to PTP time (see below)
 - **Optimized for real-time**
   - -O2 compiler optimization
   - IRAM on all hot-path conversion functions
@@ -144,6 +144,7 @@ components/aes67/
     aes67_sdp.h         SDP parser/generator
     aes67_session.h     Session manager (sources/sinks)
     aes67_audio.h       I2S audio driver with APLL and ISR playback
+    aes67_clock.h       Audio clock recovery (APLL steered to PTP)
     aes67_convert.h     Sample format conversion (MTConvert pattern)
     aes67_net.h         Network utilities
   src/
@@ -175,6 +176,7 @@ All parameters are configurable via `idf.py menuconfig` under "AES67 RAVENNA Com
   default `"ETH_DEF"` (what `ESP_NETIF_DEFAULT_ETH()` creates). Node init fails
   with a clear error if no netif has that key.
 - Jitter buffer depth (default: 4ms)
+- Audio clock recovery on/off and its maximum correction (default: on, 200 ppm)
 - PSRAM usage for buffers
 - I2S pin assignments
 - Task priorities
@@ -266,7 +268,34 @@ Capture:
 Timing:
   PTP clock -> hardware timer ISR -> audio frame task (TIC) -> RTP TX
   APLL clock -> I2S DMA -> 48kHz sample-accurate playback
+  I2S DMA ISR (frames played, PTP time) -> clock loop -> APLL trim
 ```
+
+### Audio clock recovery
+
+The I2S master clock comes from the APLL, which has the crystal's error
+(tens of ppm); PTP time comes from the network. Without correction a
+receiver's playout buffer slowly fills or drains and a sender's stream
+runs at not quite 48000 frames per PTP second. The clock loop
+(`aes67_clock.c`) closes that gap:
+
+- the TX DMA ISR records, once per descriptor, how many frames the DAC has
+  played and what PTP time it was;
+- ten times a second a PI controller computes the phase error (frames
+  played minus frames PTP time says there should be) and trims the APLL's
+  sigma-delta word so the error goes to zero. Capture shares the master
+  clock and inherits the lock;
+- the correction is clamped (`CONFIG_AES67_CLOCK_MAX_CORRECTION_PPM`,
+  default 200) and slew-limited to 2 ppm per update, so pull-in is
+  inaudible; one modulator step is about 1.7 ppm;
+- while PTP is not locked the last correction is held (holdover), and a
+  step in PTP time only re-anchors the phase reference.
+
+`aes67_node_get_clock_status()` (and `GET /api/clock`, and the "Audio
+clock" row of the web page) report the state (free, locking, locked,
+holdover), the applied correction, the phase error, the residual rate error
+and the number of playout dropouts. `CONFIG_AES67_CLOCK_RECOVERY=n` leaves the
+audio clock free-running.
 
 ## Key Design Decisions
 

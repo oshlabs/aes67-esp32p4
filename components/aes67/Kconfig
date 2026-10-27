@@ -198,6 +198,28 @@ menu "AES67 RAVENNA Component"
             above five times this value. With hardware timestamps a few
             microseconds are achievable; with software timestamps tens.
 
+    config AES67_CLOCK_RECOVERY
+        bool "Steer the audio clock (APLL) to PTP"
+        default y
+        help
+            Lock the I2S master clock to PTP time by trimming the APLL's
+            sigma-delta word: a slow PI loop keeps the DAC's frame count on
+            PTP time, so playout buffers neither drain nor fill and the
+            sent streams run at exactly the nominal rate. Requires the I2S
+            clock source to be the APLL (it is). Off: the audio clock
+            free-runs at the crystal's error.
+
+    config AES67_CLOCK_MAX_CORRECTION_PPM
+        int "Maximum audio clock correction (ppm)"
+        default 200
+        range 10 1000
+        depends on AES67_CLOCK_RECOVERY
+        help
+            The loop never pulls the APLL further than this from nominal.
+            Crystal errors are tens of ppm; the default leaves room for a
+            poor crystal without letting a broken PTP reference drag the
+            audio clock far off.
+
     config AES67_WEBUI_ENABLED
         bool "Enable WebUI"
         default y

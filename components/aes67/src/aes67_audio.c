@@ -21,9 +21,6 @@
 #include "driver/i2s_common.h"
 #include "esp_timer.h"
 #include "esp_cache.h"
-#include "hal/i2s_ll.h"
-#include "hal/hal_utils.h"
-#include "soc/hp_sys_clkrst_struct.h"
 
 static const char *TAG = "aes67_audio";
 
@@ -187,10 +184,34 @@ static StreamBufferHandle_t s_isr_stream_buf = NULL;
 #define AES67_AUDIO_STREAM_BUF_BYTES 65536   /* ~170 ms of stereo int32 at 48 kHz */
 static StreamBufferHandle_t s_capture_stream_buf = NULL;
 
-/* ISR diagnostics */
+/* ISR diagnostics: interval counters reset by aes67_audio_log_isr_stats()
+ * and totals that are never reset */
 static volatile uint32_t s_isr_fires = 0;
 static volatile uint32_t s_isr_full = 0;
 static volatile uint32_t s_isr_empty = 0;
+static volatile uint32_t s_isr_fires_total = 0;
+static volatile uint32_t s_isr_dropouts = 0;     /* playout ran dry while it was playing */
+static bool s_isr_was_full = false;
+
+/* Playout clock snapshot. The TX DMA ISR runs once per descriptor, i.e.
+ * every DMA_FRAME_NUM frames the DAC has consumed; it records how many
+ * frames have gone out and what the reference clock read at that moment.
+ * The clock-recovery loop compares the two to see how far the audio clock
+ * has run against PTP. A sequence counter makes the pair consistent for a
+ * reader that is interrupted by the writer. */
+#define PLAYOUT_FRAME_BYTES     (2 * sizeof(int32_t))   /* two 32-bit slots */
+static aes67_audio_clock_fn_t s_clock_fn = NULL;
+static volatile uint32_t s_snap_seq = 0;
+static uint64_t s_snap_frames = 0;
+static uint64_t s_snap_time_ns = 0;
+static uint64_t s_frames_out = 0;
+/* A descriptor whose interrupt was not serviced in time (interrupts held
+ * off for longer than one descriptor period) was still clocked out by the
+ * DMA, replaying stale data. It is detected from the gap between service
+ * times and counted, so the frame count stays true to what the DAC did. */
+static uint64_t s_last_isr_ns = 0;
+static uint32_t s_desc_period_ns = 0;
+static volatile uint32_t s_isr_missed = 0;
 
 
 /* Last frame for sample-hold on underrun (less audible than silence) */
@@ -205,6 +226,31 @@ static IRAM_ATTR bool on_i2s_tx_sent_sbuf(i2s_chan_handle_t handle,
 {
     BaseType_t woken = pdFALSE;
     s_isr_fires++;
+    s_isr_fires_total++;
+
+    /* Frames clocked out so far, stamped with the reference clock */
+    uint32_t frames = event->size / PLAYOUT_FRAME_BYTES;
+    s_frames_out += frames;
+    if (s_clock_fn) {
+        uint64_t now = s_clock_fn();
+        if (s_last_isr_ns != 0 && s_desc_period_ns != 0 && now > s_last_isr_ns) {
+            uint64_t gap = now - s_last_isr_ns;
+            if (gap > s_desc_period_ns + s_desc_period_ns / 2) {
+                uint32_t missed = (uint32_t)((gap + s_desc_period_ns / 2) / s_desc_period_ns) - 1;
+                /* Beyond 100 ms it is a step of the reference clock, not a
+                 * stall; leave the count alone (the clock loop re-anchors) */
+                if (missed <= 300) {
+                    s_frames_out += (uint64_t)missed * frames;
+                    s_isr_missed += missed;
+                }
+            }
+        }
+        s_last_isr_ns = now;
+        s_snap_seq++;                   /* odd: being written */
+        s_snap_frames = s_frames_out;
+        s_snap_time_ns = now;
+        s_snap_seq++;                   /* even: consistent */
+    }
 
     if (s_isr_stream_buf) {
         size_t received = xStreamBufferReceiveFromISR(s_isr_stream_buf,
@@ -213,6 +259,7 @@ static IRAM_ATTR bool on_i2s_tx_sent_sbuf(i2s_chan_handle_t handle,
                                                        &woken);
         if (received >= event->size) {
             s_isr_full++;
+            s_isr_was_full = true;
             /* Save last frame for sample-hold on next underrun */
             int32_t *samples = (int32_t *)event->dma_buf;
             uint32_t last_idx = (event->size / sizeof(int32_t)) - 2;
@@ -220,6 +267,12 @@ static IRAM_ATTR bool on_i2s_tx_sent_sbuf(i2s_chan_handle_t handle,
             s_last_frame[1] = samples[last_idx + 1];
         } else {
             s_isr_empty++;
+            /* A dropout is the moment a playing stream runs dry; descriptors
+             * with nothing to play while no sink is active are not counted */
+            if (s_isr_was_full) {
+                s_isr_dropouts++;
+                s_isr_was_full = false;
+            }
             /* Sample-hold: fill with last known frame instead of silence.
              * Decays toward zero to avoid DC offset on stream stop. */
             int32_t *dst = (int32_t *)event->dma_buf;
@@ -279,6 +332,52 @@ StreamBufferHandle_t aes67_audio_get_playout_buf(aes67_audio_handle_t handle)
 {
     (void)handle;
     return s_isr_stream_buf;
+}
+
+void aes67_audio_set_clock_source(aes67_audio_handle_t handle, aes67_audio_clock_fn_t now_ns)
+{
+    (void)handle;
+    s_clock_fn = now_ns;
+}
+
+esp_err_t aes67_audio_get_playout_snapshot(aes67_audio_handle_t handle,
+                                           uint64_t *frames_out, uint64_t *time_ns)
+{
+    if (!handle || !frames_out || !time_ns) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_clock_fn) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Retry while the ISR is writing (odd) or wrote in between */
+    for (int tries = 0; tries < 8; tries++) {
+        uint32_t seq1 = s_snap_seq;
+        if (seq1 & 1) {
+            continue;
+        }
+        uint64_t f = s_snap_frames;
+        uint64_t t = s_snap_time_ns;
+        if (s_snap_seq == seq1) {
+            if (seq1 == 0) {
+                return ESP_ERR_NOT_FOUND;       /* no snapshot yet */
+            }
+            *frames_out = f;
+            *time_ns = t;
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t aes67_audio_get_dma_stats(aes67_audio_handle_t handle, aes67_audio_dma_stats_t *stats)
+{
+    if (!handle || !stats) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    stats->isr_fires = s_isr_fires_total;
+    stats->isr_missed = s_isr_missed;
+    stats->dropouts = s_isr_dropouts;
+    return ESP_OK;
 }
 
 
@@ -581,6 +680,9 @@ esp_err_t aes67_audio_start(aes67_audio_handle_t handle)
         return ESP_OK;
     }
 
+    s_desc_period_ns = (uint32_t)((uint64_t)DMA_FRAME_NUM * 1000000000ULL / handle->config.sample_rate);
+    s_last_isr_ns = 0;
+
     /* Register DMA ISR callback for direct stream buffer -> DMA transfer.
      * This bypasses i2s_channel_write and the playback task entirely. */
     /* Register TX DMA ISR (playback: stream buffer -> I2S) */
@@ -632,11 +734,6 @@ esp_err_t aes67_audio_start(aes67_audio_handle_t handle)
     }
 
     handle->running = true;
-
-    /* Read and cache the clock divider set by i2s_channel_init_std_mode.
-     * This gives us the correct base values for adaptive clock recovery. */
-    extern void aes67_audio_read_clock_divider(aes67_audio_handle_t h);
-    aes67_audio_read_clock_divider(handle);
 
     ESP_LOGI(TAG, "Audio started (DMA: %d desc x %d frames, DMA-paced)",
              DMA_DESC_NUM, DMA_FRAME_NUM);
@@ -905,82 +1002,6 @@ void aes67_audio_get_staging_stats(aes67_audio_handle_t handle,
         if (isr_count) *isr_count = handle->staging_isr_count;
         if (underruns) *underruns = handle->staging_underruns;
     }
-}
-
-/* Cached base divider values (read from registers after I2S init) */
-static uint32_t base_div_n = 0;
-static uint32_t base_div_x = 0;
-static uint32_t base_div_y = 0;
-static uint32_t base_div_z = 0;
-static uint32_t base_div_yn1 = 0;
-static uint32_t base_numerator = 0;
-static uint32_t base_denominator = 0;
-
-/* Read and cache the I2S0 TX clock divider from hardware registers.
- * Must be called AFTER i2s_channel_init_std_mode(). */
-void aes67_audio_read_clock_divider(aes67_audio_handle_t handle)
-{
-    (void)handle;
-    base_div_n = HP_SYS_CLKRST.peri_clk_ctrl13.reg_i2s0_tx_div_n;
-    base_div_x = HP_SYS_CLKRST.peri_clk_ctrl13.reg_i2s0_tx_div_x;
-    base_div_y = HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_y;
-    base_div_z = HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_z;
-    base_div_yn1 = HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_yn1;
-
-    /* Reverse the x,y,z,yn1 -> numerator,denominator conversion */
-    if (base_div_z > 0) {
-        base_denominator = (base_div_x + 1) * base_div_z + base_div_y;
-        base_numerator = base_div_yn1 ? (base_denominator - base_div_z) : base_div_z;
-    }
-
-    ESP_LOGI("aes67_audio", "I2S0 TX clk: N=%lu, x=%lu, y=%lu, z=%lu, yn1=%lu "
-             "-> numer=%lu denom=%lu (divider=N+%lu/%lu)",
-             (unsigned long)base_div_n, (unsigned long)base_div_x,
-             (unsigned long)base_div_y, (unsigned long)base_div_z,
-             (unsigned long)base_div_yn1,
-             (unsigned long)base_numerator, (unsigned long)base_denominator,
-             (unsigned long)base_numerator, (unsigned long)base_denominator);
-}
-
-/* Adjust the I2S TX MCLK divider at runtime to fine-tune sample rate.
- * This is used for adaptive clock recovery: speed up or slow down the
- * I2S clock to match the network source rate.
- * ppm_adj: parts-per-million adjustment. +100 = 0.01% faster. */
-void aes67_audio_adjust_clock_ppm(aes67_audio_handle_t handle, int32_t ppm_adj)
-{
-    if (!handle || base_denominator == 0) return;
-
-    /* Adjust numerator relative to the cached base values.
-     * Increasing numerator = larger divider = slower clock.
-     * ppm_adj > 0 means "source is faster, speed up I2S" = decrease numerator. */
-    int64_t adj = (int64_t)ppm_adj * (int64_t)base_denominator / 1000000;
-    int32_t new_numer = (int32_t)base_numerator - (int32_t)adj;
-    if (new_numer < 1) new_numer = 1;
-    if (new_numer > (int32_t)base_denominator - 1) new_numer = base_denominator - 1;
-
-    /* Convert numerator/denominator back to x,y,z,yn1 format */
-    uint32_t numer = (uint32_t)new_numer;
-    uint32_t denom = base_denominator;
-    uint32_t div_yn1 = numer * 2 > denom;
-    uint32_t div_z = div_yn1 ? denom - numer : numer;
-    uint32_t div_x = div_z ? (denom / div_z - 1) : 0;
-    uint32_t div_y = div_z ? (denom % div_z) : 0;
-
-    /* Write to I2S0 TX clock divider registers.
-     * Workaround: set small div first, then target. */
-    HAL_FORCE_MODIFY_U32_REG_FIELD(HP_SYS_CLKRST.peri_clk_ctrl13,
-                                    reg_i2s0_tx_div_n, 2);
-    HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_yn1 = 0;
-    HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_y = 1;
-    HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_z = 0;
-    HP_SYS_CLKRST.peri_clk_ctrl13.reg_i2s0_tx_div_x = 0;
-    /* Set target */
-    HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_yn1 = div_yn1;
-    HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_z = div_z;
-    HP_SYS_CLKRST.peri_clk_ctrl14.reg_i2s0_tx_div_y = div_y;
-    HP_SYS_CLKRST.peri_clk_ctrl13.reg_i2s0_tx_div_x = div_x;
-    HAL_FORCE_MODIFY_U32_REG_FIELD(HP_SYS_CLKRST.peri_clk_ctrl13,
-                                    reg_i2s0_tx_div_n, base_div_n);
 }
 
 SemaphoreHandle_t aes67_audio_get_dma_sem(aes67_audio_handle_t handle)

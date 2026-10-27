@@ -127,6 +127,10 @@ typedef struct {
 
 esp_err_t aes67_node_get_rx_stats(aes67_node_handle_t handle, aes67_node_rx_stats_t *stats);
 
+/* Audio clock recovery: how the APLL is tracking PTP */
+#include "aes67_clock.h"
+esp_err_t aes67_node_get_clock_status(aes67_node_handle_t handle, aes67_clock_status_t *status);
+
 
 #ifdef __cplusplus
 }

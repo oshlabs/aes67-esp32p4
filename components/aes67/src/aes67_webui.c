@@ -233,6 +233,31 @@ static void json_ptp_object(jbuf_t *jb, const aes67_ptp_status_t *st)
         (long)st->drift_ppb, (long)st->path_delay_ns);
 }
 
+static const char *clock_state_str(aes67_clock_state_t st)
+{
+    switch (st) {
+    case AES67_CLOCK_OFF:       return "off";
+    case AES67_CLOCK_FREE:      return "free";
+    case AES67_CLOCK_LOCKING:   return "locking";
+    case AES67_CLOCK_LOCKED:    return "locked";
+    case AES67_CLOCK_HOLDOVER:  return "holdover";
+    }
+    return "unknown";
+}
+
+static void json_clock_object(jbuf_t *jb, struct aes67_webui *ctx)
+{
+    aes67_clock_status_t st = {0};
+    aes67_node_get_clock_status(ctx->node, &st);
+    jb_printf(jb,
+        "{\"state\":\"%s\",\"correction_ppb\":%ld,\"phase_error_ns\":%ld,"
+        "\"rate_error_ppb\":%ld,\"writes\":%lu,\"reanchors\":%lu,"
+        "\"holdovers\":%lu,\"dropouts\":%lu,\"missed\":%lu}",
+        clock_state_str(st.state), (long)st.correction_ppb, (long)st.phase_error_ns,
+        (long)st.rate_error_ppb, (unsigned long)st.writes, (unsigned long)st.reanchors,
+        (unsigned long)st.holdovers, (unsigned long)st.dropouts, (unsigned long)st.missed);
+}
+
 static void json_info_object(jbuf_t *jb, struct aes67_webui *ctx)
 {
     aes67_config_t cfg;
@@ -468,6 +493,15 @@ static esp_err_t handler_api_ptp(httpd_req_t *req)
 }
 
 /* ---- GET /api/sources, /api/sinks, /api/sap/remotes ---- */
+
+static esp_err_t handler_api_clock(httpd_req_t *req)
+{
+    struct aes67_webui *ctx = (struct aes67_webui *)req->user_ctx;
+    jbuf_t jb;
+    jb_init(&jb, ctx->json, JSON_BUF_SIZE);
+    json_clock_object(&jb, ctx);
+    return send_json(req, &jb);
+}
 
 static esp_err_t handler_api_sources(httpd_req_t *req)
 {
@@ -887,6 +921,8 @@ static int build_status_frame(struct aes67_webui *ctx, char *buf, size_t cap)
               (unsigned long)(esp_timer_get_time() / 1000000),
               (unsigned long)esp_get_free_heap_size());
     json_ptp_object(&jb, &ptp_st);
+    jb_printf(&jb, ",\"clock\":");
+    json_clock_object(&jb, ctx);
 
     bool complete = true;
     jb_printf(&jb, ",\"sources\":");
@@ -1087,6 +1123,15 @@ esp_err_t aes67_webui_start(aes67_webui_handle_t handle)
         .user_ctx = handle,
     };
     httpd_register_uri_handler(handle->httpd, &uri_ptp);
+
+    /* REST: audio clock recovery status */
+    const httpd_uri_t uri_clock = {
+        .uri = "/api/clock",
+        .method = HTTP_GET,
+        .handler = handler_api_clock,
+        .user_ctx = handle,
+    };
+    httpd_register_uri_handler(handle->httpd, &uri_clock);
 
     /* REST: source streams */
     const httpd_uri_t uri_sources = {

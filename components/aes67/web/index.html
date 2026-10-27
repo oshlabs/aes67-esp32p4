@@ -29,6 +29,8 @@ header .meta{font-size:11px;color:#888;text-align:right}
 .row .val,.fv{display:inline-block;text-align:right;font-variant-numeric:tabular-nums}
 #pg{min-width:23ch;text-align:left}#po,#pj{min-width:7ch}#py{min-width:8ch}#pf{min-width:6ch}
 #pl{display:inline-block;min-width:8ch}
+#cl{display:inline-block;min-width:8ch}#cc{min-width:7ch}#cp{min-width:8ch}#cr{min-width:6ch}#cu{min-width:6ch}
+.row+.row{margin-top:6px;padding-top:6px;border-top:1px solid #222}
 #fu{min-width:11ch}#fh{min-width:13ch}#fr{min-width:6ch}#ft{min-width:12ch}#fl{min-width:6ch}
 #rl .re{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #222}
 #rl .re:last-child{border:none}
@@ -69,6 +71,13 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#666;display
 <span><span class="lbl">Jitter </span><span class="val" id="pj">--</span><span class="lbl"> ns</span></span>
 <span><span class="lbl">Drift </span><span class="val" id="pf">--</span><span class="lbl"> ppm</span></span>
 <span><span class="lbl">Delay </span><span class="val" id="py">--</span><span class="lbl"> ns</span></span>
+</div>
+<div class="row" title="Audio clock: the I2S master clock (APLL) steered to PTP time">
+<span><span class="dot dr" id="cd"></span><span class="lbl">Audio clock </span><span id="cl">--</span></span>
+<span><span class="lbl">Correction </span><span class="val" id="cc">--</span><span class="lbl"> ppm</span></span>
+<span><span class="lbl">Phase </span><span class="val" id="cp">--</span><span class="lbl"> &micro;s</span></span>
+<span><span class="lbl">Rate </span><span class="val" id="cr">--</span><span class="lbl"> ppm</span></span>
+<span><span class="lbl">Dropouts </span><span class="val" id="cu">--</span></span>
 </div>
 </div>
 <div class="card" id="ctlc" style="display:none"><h2>Controls</h2><div id="ctl"></div></div>
@@ -268,6 +277,13 @@ function onMsg(e){
   g("pj").textContent=fmt(p.jitter_ns);
   g("pf").textContent=p.drift_ppb!=null?(p.drift_ppb/1000).toFixed(2):"--";
   g("py").textContent=fmt(p.path_delay_ns);
+  var c=d.clock||{};
+  g("cd").className="dot "+(c.state==="locked"?"dg":c.state==="locking"||c.state==="holdover"?"da":"dr");
+  g("cl").textContent=c.state||"--";
+  g("cc").textContent=c.correction_ppb!=null?(c.correction_ppb/1000).toFixed(2):"--";
+  g("cp").textContent=c.phase_error_ns!=null?(c.phase_error_ns/1000).toFixed(1):"--";
+  g("cr").textContent=c.rate_error_ppb!=null?(c.rate_error_ppb/1000).toFixed(2):"--";
+  g("cu").textContent=fmt(c.dropouts);
   updateSlots("src",d.sources);
   updateSlots("sink",d.sinks);
   renderRemotes(d.sap_remotes);
