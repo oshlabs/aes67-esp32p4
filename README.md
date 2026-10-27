@@ -9,6 +9,8 @@ An ESP-IDF component implementing the AES67 (and RAVENNA-compatible) audio-over-
 - **0 packet loss** with IEEE 802.3x flow control
 - Tested at 645,000+ packets with zero drops or sequence gaps
 - ISR-driven playback at up to 3000Hz with zero task scheduling overhead
+- PTP offset to a GPS grandmaster over UDP within +/-0.85 us (hardware timestamps);
+  audio clock locked to PTP within +/-11 us of phase
 
 ### Latency by Source Ptime
 
@@ -25,7 +27,7 @@ An ESP-IDF component implementing the AES67 (and RAVENNA-compatible) audio-over-
 |---|---|
 | Source ptime buffering | 0.125ms |
 | Network (LAN) | 0.1ms |
-| Ethernet L2 hook (parse + convert) | 0.1ms |
+| Ethernet receive hook (parse + convert) | 0.1ms |
 | Stream buffer | 0.06ms |
 | DMA ring (2 x 16 frames) | 0.33ms |
 | **Total** | **~0.72ms** |
@@ -63,17 +65,20 @@ say what is missing.
   delay requests on either transport
   - timeReceiver mode: synchronizes to an external PTP grandmaster
   - Grandmaster mode: becomes the timeTransmitter when no other grandmaster is present
-  - Role names follow IEEE 1588g-2022 (timeTransmitter / timeReceiver, TT / TR); the
+  - Role names follow IEEE 1588g-2022 (timeTransmitter / timeReceiver); the
     vendored daemon keeps the protocol's own field names
-  - PI controller with adaptive gain for fast lock and stable tracking
+  - Lock state from the low-pass filtered offset, with hysteresis; status reports
+    transport, grandmaster identity and clock class, offset, jitter, drift, path delay
 - **RTP audio streaming** with ISR-driven DMA playback
   - Source (TX) and Sink (RX) streams
   - L16, L24, L32, AM824 codec support with MTConvert function pointer dispatch
   - Channels: 1-8 per stream on the wire; the I2S output is two slots, fed by
     the sink's `routing[]` (defaults: channels 0 and 1; a mono stream feeds both)
-  - Sample rates: 44.1kHz, 48kHz
-  - Packet time: 0.125ms to 4ms (6 to 192 frames)
+  - Sample rate: 48kHz (44.1kHz at frame counts that divide evenly)
+  - Packet time: 0.125ms to 4ms (6 to 192 frames); each source is paced on its own
+    frame grid, timestamps anchored to the PTP media clock
   - Handles 250 to 8000+ packets per second
+  - A sink follows a new SSRC after two seconds of silence (source restarts)
   - DSCP/QoS marking for network prioritization
   - Ethernet receive hook inside the component: RTP for active sinks and PTP over
     UDP are taken off the driver's input path before lwIP, matched per sink on
@@ -88,12 +93,17 @@ say what is missing.
   - User callback with int32 sample buffers
   - FreeRTOS StreamBuffer for application-level processing
 - **SAP (RFC 2974)** session announcement and discovery
-  - Periodic multicast announcements for source streams
-  - Remote source discovery with auto-subscribe callback
+  - Announcements every 30 s (two quick repeats on creation); remote sources expire
+    after ten times their observed interval
+  - Remote source discovery callback (the example auto-subscribes)
 - **SDP** generation and parsing (AES67-compliant)
-  - PTP reference clock attributes (`a=ts-refclk`)
-  - Media clock attributes (`a=mediaclk`)
-  - Fractional ptime support for sub-millisecond packet times
+  - `a=ts-refclk` names the grandmaster the node is locked to (and `traceable` when
+    its clock class says so); re-announced on PTP lock changes
+  - `a=mediaclk`, `a=framecount`, fractional ptime (0.333 ms is 16 frames)
+  - Parser accepts the descriptions of Dante, SIENNA and the Linux daemon (host-tested)
+- **Web UI** (optional): live page with the two clocks, sources, sinks and discovery
+  over a WebSocket, a REST API, a registry for runtime controls the application
+  registers (the example: mic gain, volume), header-, token- and rate-limited writes
 - **mDNS/DNS-SD** device advertisement (`_ravenna._udp`, TXT from the configuration; no
   `_rtsp._tcp`, as no RTSP server runs here, streams are found over SAP)
 - **I2S audio** driver with APLL clock
@@ -105,8 +115,8 @@ say what is missing.
   - IRAM on all hot-path conversion functions
   - lwIP IRAM optimizations
   - IPv6 disabled (saves 39KB flash, reduces packet processing)
-  - All tasks pinned to core 0 for cache coherency
-  - Quiet logging: only reports errors and first lock
+  - Audio and network tasks pinned to core 0; the clock-recovery writer on core 1
+  - Nothing logs from the frame task; periodic status lines are rate limited
 
 ## Hardware
 
@@ -137,7 +147,7 @@ Ethernet and codec pinout and works unchanged.
 
 ## Build
 
-Requires ESP-IDF v5.5+ with the ESP32-P4 target.
+Requires ESP-IDF v5.5.2+ with the ESP32-P4 target.
 
 ```bash
 idf.py set-target esp32p4
@@ -154,8 +164,10 @@ Configure with the overlay once, the choice is cached in the build directory:
 idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.p4v3" set-target esp32p4
 ```
 
-`tools/` holds Python helpers to verify a node against a real AES67 receiver
-(wire probe, reference sender, receiver control); see `tools/README.md`.
+`tools/` holds Python helpers to verify a node against real AES67 devices (wire
+probe, reference sender, receiver control, SAP announcer, API churn test); see
+`tools/README.md`. `test/` has host tests and a minimal consumer project; see
+`test/README.md`.
 
 ## Component Architecture
 
@@ -173,17 +185,25 @@ components/aes67/
     aes67_clock.h       Audio clock recovery (APLL steered to PTP)
     aes67_convert.h     Sample format conversion (MTConvert pattern)
     aes67_net.h         Network utilities
+    aes67_webui.h       Web UI: HTTP, WebSocket, REST, runtime controls
+  private_include/      Ethernet receive hook, frame timer, mDNS, driver internals
   src/
-    aes67.c             Node lifecycle and output routing
+    aes67.c             Node lifecycle, frame task (TIC), output routing
     aes67_ptp.c         PTP wrapping ptpd + esp_eth_time
-    aes67_rtp.c         RTP engine with per-stream jitter buffers
+    aes67_rtp.c         RTP engine: frame-path decoder, per-sink matching, transmit pacing
+    aes67_eth_rx.c      Ethernet receive hook (PTP and RTP before lwIP)
+    aes67_hw_timer.c    PTP-driven frame timer on the media clock's frame grid
+    aes67_clock.c       Audio clock recovery (APLL steered to PTP)
     aes67_sap.c         SAP multicast announcements
     aes67_sdp.c         SDP text generation/parsing
     aes67_session.c     Stream orchestration
-    aes67_audio.c       I2S DMA driver with ISR-driven playback
+    aes67_audio.c       I2S DMA driver with ISR-driven playback and capture
     aes67_convert.c     L16/L24/L32/AM824 format conversion (IRAM)
     aes67_net.c         Multicast socket helpers
     aes67_mdns.c        mDNS service registration
+    aes67_webui.c       Web UI
+  web/index.html        The page (gzipped into the build)
+  third_party/          Vendored PTP daemon and EMAC time wrapper (see PATCHES.md)
 ```
 
 ## Configuration
@@ -304,7 +324,9 @@ Playback (ISR-driven, default):
   alternate: one plays while the other is filled.
 
 Capture:
-  ADC -> I2S RX DMA -> capture ring buffer -> RTP TX -> network
+  ADC -> I2S RX DMA -> capture StreamBuffer -> frame task (TIC, one tick per
+  packet period on the PTP frame grid) -> engine: per-source rings -> RTP TX,
+  each source paced by its own packet time -> network
 
 Timing:
   PTP clock -> hardware timer ISR -> audio frame task (TIC) -> RTP TX
@@ -333,7 +355,7 @@ runs at not quite 48000 frames per PTP second. The clock loop
   step in PTP time only re-anchors the phase reference.
 
 `aes67_node_get_clock_status()` (and `GET /api/clock`, and the "Audio
-clock" row of the web page) report the state (free, locking, locked,
+clock" tile of the web page) report the state (free, locking, locked,
 holdover), the applied correction, the phase error, the residual rate error
 and the number of playout dropouts. `CONFIG_AES67_CLOCK_RECOVERY=n` leaves the
 audio clock free-running.
@@ -345,5 +367,7 @@ audio clock free-running.
 - **IEEE 802.3x flow control** prevents the ESP32-P4 EMAC from dropping multicast frames under load (8% loss without it)
 - **Sample-hold on underrun** produces smooth decay instead of audible silence clicks
 - **StreamBuffer byte-stream** handles any packet time (0.125ms to 4ms) transparently by accumulating bytes
-- **All tasks on core 0** avoids cross-core L1 cache visibility issues on ESP32-P4 dual RISC-V
+- **Audio and network tasks on core 0** avoids cross-core L1 cache visibility issues on ESP32-P4 dual RISC-V; the clock-recovery task runs on core 1 so its register writes never hold off the I2S interrupt
+- **Frame ticks reconstructed from PTP time**: the timer interrupt only wakes the frame task, which works out from the clock how many packet periods have passed, so a wake-up lost to a busy core never loses a packet
+- **One decoder for the receive path**: the engine decodes from the driver's input path, so sinks are matched and locked before anything is decoded; the socket path is the fallback, not a second implementation
 - **DMA descriptors sized to 16 frames** (0.33ms) balances latency vs stability across all ptimes
